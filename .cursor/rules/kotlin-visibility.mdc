@@ -1,0 +1,16 @@
+---
+description: Kotlin visibility for kotlin-otp — avoid private types in broader API signatures
+globs: **/*.kt
+---
+
+# Kotlin visibility (this repo)
+
+- **Rule:** A type used in a **public** or **internal** API surface (constructor parameters, public method params/returns, public generic bounds) must be **at least as visible** as that API. A **file-private** (`private class` / top-level `private`) type must **not** appear in an `internal` or `public` signature — the compiler will error (e.g. “internal function exposes private-in-file parameter type”).
+- **Prefer** (in order):
+  1. **Narrow the API type:** e.g. pass `() -> List<PublicSnapshot>` or an `internal` functional interface instead of `List<PrivateImpl>` on a `SupervisorRef`-style handle.
+  2. **Widen carefully:** `internal` on implementation types only when they are intentionally module-wide building blocks, not “escape hatches” for leaks.
+  3. **Avoid** widening to `public` just to silence errors — that expands your published ABI.
+
+When adding `internal constructor` or `internal` members on a **public** class, double-check parameter and property types are not file-private.
+
+**See also:** [kotlin-coroutines-boundaries.mdc](kotlin-coroutines-boundaries.mdc) (suspend + `runCatching`, `Any?` at GenServer boundaries).

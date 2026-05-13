@@ -1,0 +1,40 @@
+---
+description: Coroutines / suspend + GenServer wire boundaries in kotlin-otp
+globs: **/*.kt
+---
+
+# Coroutines and API boundaries (this repo)
+
+## `runBlocking` and `Dispatchers.Default`
+
+- Avoid **`runBlocking(Dispatchers.Default)`** when the block starts **coroutines that also run on `Default`** (e.g. `GenServers.startLink` with default context, or **`async`** that does real work on the shared pool). `runBlocking` occupies a **worker thread** from that pool; parallel work can **starve or deadlock**.
+- Prefer plain **`runBlocking { }`** (uses its own event loop) for tests, or **`runTest`** from `kotlinx-coroutines-test`, or an explicit **`Dispatchers.IO`** / single-threaded dispatcher if you control all child dispatchers.
+- This is **orthogonal** to the **`runBlocking` + GenServer child-job wait** issue below (thread-pool contention vs structured-concurrency teardown).
+
+## `runBlocking` tests + `GenServers.startLink`
+
+- **`GenServers.startLink(this, …)`** under **`runBlocking`** creates **child [Job]s** on **`Dispatchers.Default`**. When the test lambda **returns**, **`runBlocking` waits for those children**; if actors have not shut down yet, the runner can **block until the next test**, looking like a hang on the wrong test.
+- Before leaving the **`runBlocking`** block, call **`coroutineContext.job.cancelChildren()`** (after assertions) so GenServers are torn down **deterministically** in tests.
+
+## Structured concurrency checklist (kotlinx)
+
+- **`runBlocking`**: the block runs under a **Job**; when the block **finishes**, the runtime **waits for structured child jobs** to complete (or be cancelled) before `runBlocking` returns to the caller.
+- **`coroutineScope { }`** / **`async`**: children are tied to the **caller’s Job**; cancellation and failure propagate per kotlinx rules.
+- **`GenServers.startLink(parent, …)`**: starts a **long-lived** actor coroutine (child of **`parent`**’s Job). Treat it like an OTP process: tests must **cancel** or **stop** explicitly when using **`runBlocking`** (see above).
+
+## `OtpStudyDebug` (stderr, opt-in)
+
+- **`org.otpstudy.core.OtpStudyDebug`**: when enabled, prints **`[otpstudy-debug] …`** to **`System.err`** (scatter/gather **op** ids, `InMemoryTransport` **send/call**, and JUnit **Starting/Finished** via **`OtpStudyDebugTestExtension`** on distribution tests).
+- Enable with JVM property **`org.otpstudy.debug=true`** or env **`OTPSTUDY_DEBUG=true`** (case-insensitive). For Gradle, put **`-Dorg.otpstudy.debug=true` before task names** (e.g. `./gradlew -Dorg.otpstudy.debug=true :otp-distribution:test`) or use **`-Porg.otpstudy.debug=true`**; the **`otp-distribution`** test task forwards the value to the test JVM and turns on **`showStandardStreams`** so **`[otpstudy-debug]`** lines (stderr) appear in the console.
+- **`OtpLogging`** remains a **no-op** in tests unless **`OtpLogging.setLogger`** is used — use **`OtpStudyDebug`** for ad-hoc tracing without wiring a logger.
+
+## Suspend vs `runCatching`
+
+- **`kotlin.runCatching { }`** takes a **non-suspending** lambda. Do **not** use it to wrap **`suspend`** calls (`NodeTransport.send`, `withTimeout { ... }`, `GenServerRef.call`, etc.).
+- **`kotlinx.coroutines.runCatching`** is not a drop-in replacement for “catch errors in suspend code”; prefer **`try` / `catch`** inside **`suspend` functions** or **`async` blocks**, and build **`Result.success` / `Result.failure`** when you need `fold`.
+- Do **not** import `runCatching` from **`kotlinx.coroutines`** unless you have verified the symbol exists and matches the intended semantics.
+
+## `Any?` → `GenServerRef`
+
+- **`GenServerRef.cast`** and **`call`** take **`Any`**, not **`Any?`**.
+- Decoded JSON may be **`null`** (`JsonNull`). Map at **one** place: use **`DistributionWire.decodeGenServerPayload`** (or **`asGenServerPayload`**) so every transport path stays consistent (default: **`null` → `Unit`**).
