@@ -16,6 +16,7 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import java.io.File
 import java.nio.file.Files
 import kotlin.test.AfterTest
@@ -81,7 +82,7 @@ code_change(_, State, _) -> {ok, State}.
 
     /** kotlin-otp counter server mirroring the Erlang reference implementation. */
     private class KotlinCounterServer : GenServer<Long> {
-        override suspend fun init() = InitResult.Ok(0L)
+        override suspend fun init(self: GenServerRef<Long>) = InitResult.Ok(0L)
 
         override suspend fun handleCall(request: Any, state: Long): ReplyResult<Long> = when {
             request == "get" -> ReplyResult.Reply(state, state)

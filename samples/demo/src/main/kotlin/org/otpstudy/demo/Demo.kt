@@ -22,7 +22,7 @@ import kotlin.time.Duration.Companion.seconds
 private data class EchoState(val label: String)
 
 private class EchoServer : GenServer<EchoState> {
-    override suspend fun init(): InitResult<EchoState> = InitResult.Ok(EchoState("echo"))
+    override suspend fun init(self: GenServerRef<EchoState>): InitResult<EchoState> = InitResult.Ok(EchoState("echo"))
 
     override suspend fun handleCall(
         request: Any,
@@ -43,7 +43,7 @@ private data class FlakyState(
 private class FlakyServer(
     private val boomAfterCalls: Int,
 ) : GenServer<FlakyState> {
-    override suspend fun init(): InitResult<FlakyState> {
+    override suspend fun init(self: GenServerRef<FlakyState>): InitResult<FlakyState> {
         println("FlakyServer init (supervisor (re)start)")
         return InitResult.Ok(FlakyState(boomAfterCalls))
     }

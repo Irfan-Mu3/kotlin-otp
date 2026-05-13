@@ -33,7 +33,7 @@ class ProfiledGenServer<S>(private val inner: GenServer<S>) : GenServer<S> {
         }
     }
 
-    override suspend fun init(): InitResult<S> = timed("init") { inner.init() }
+    override suspend fun init(self: GenServerRef<S>): InitResult<S> = timed("init") { inner.init(self) }
 
     override suspend fun handleCallFrom(request: Any, state: S, from: ReplyHandle<S>): ReplyResult<S> =
         timed("handleCallFrom") { inner.handleCallFrom(request, state, from) }

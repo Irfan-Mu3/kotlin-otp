@@ -31,4 +31,5 @@ include(
     "otp-trace",
     "otp-dets",
     "samples:demo",
+    "samples:poolboy",
 )

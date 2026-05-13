@@ -21,6 +21,13 @@ globs: **/*.kt
 - **`runBlocking`**: the block runs under a **Job**; when the block **finishes**, the runtime **waits for structured child jobs** to complete (or be cancelled) before `runBlocking` returns to the caller.
 - **`coroutineScope { }`** / **`async`**: children are tied to the **caller’s Job**; cancellation and failure propagate per kotlinx rules.
 - **`GenServers.startLink(parent, …)`**: starts a **long-lived** actor coroutine (child of **`parent`**’s Job). Treat it like an OTP process: tests must **cancel** or **stop** explicitly when using **`runBlocking`** (see above).
+- **`GenServerRef.call`** records **[Job] in `GenServerMsg.Call`** from the caller context **before** `withTimeout`; do not assume you can re-read `currentCoroutineContext()[Job]` inside `handleCallFrom` and get the same semantics as the outer client.
+
+## JUnit 5 and `@Test` return types
+
+- A `@Test` method must compile to **`void`** on the JVM for JUnit Jupiter to run it.
+- If the body is an **expression** whose type is not `Unit` (common with `runBlocking { assertNotNull(x) }` where the last expression is the assertion’s return value), the method signature becomes **`T foo()`** and the test is **silently not executed** (no failure, no “skipped” entry).
+- Prefer an explicit **`: Unit`** return type and end the block with **`Unit`**, or use a block body whose last statement is not a non-`Unit` expression.
 
 ## `OtpStudyDebug` (stderr, opt-in)
 

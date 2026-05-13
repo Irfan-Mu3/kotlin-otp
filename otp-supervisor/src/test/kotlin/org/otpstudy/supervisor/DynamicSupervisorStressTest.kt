@@ -38,7 +38,8 @@ class DynamicSupervisorStressTest {
         val template = SimpleOneForOneTemplate(
             restart = Restart.Temporary,
             shutdown = Shutdown.BrutalKill,
-        ) {
+        ) { _, _, ready ->
+            ready(Unit)
             delay(Long.MAX_VALUE)
         }
 
@@ -68,7 +69,8 @@ class DynamicSupervisorStressTest {
         val template = SimpleOneForOneTemplate(
             restart = Restart.Temporary,
             shutdown = Shutdown.BrutalKill,
-        ) {
+        ) { _, _, ready ->
+            ready(Unit)
             delay(Long.MAX_VALUE)
         }
 
@@ -98,7 +100,8 @@ class DynamicSupervisorStressTest {
         val template = SimpleOneForOneTemplate(
             restart = Restart.Permanent,
             shutdown = Shutdown.BrutalKill,
-        ) {
+        ) { _, _, ready ->
+            ready(Unit)
             val n = crashCount.incrementAndGet()
             if (n < 5) {
                 error("crash $n")
@@ -133,7 +136,8 @@ class DynamicSupervisorStressTest {
         val template = SimpleOneForOneTemplate(
             restart = Restart.Temporary,
             shutdown = Shutdown.BrutalKill,
-        ) {
+        ) { _, _, ready ->
+            ready(Unit)
             delay(Long.MAX_VALUE)
         }
 
@@ -171,7 +175,8 @@ class DynamicSupervisorStressTest {
         val template = SimpleOneForOneTemplate(
             restart = Restart.Permanent,
             shutdown = Shutdown.BrutalKill,
-        ) { childId ->
+        ) { _, childId, ready ->
+            ready(Unit)
             val count = synchronized(lock) {
                 startCounts[childId] = (startCounts[childId] ?: 0) + 1
                 startCounts[childId]!!

@@ -8,7 +8,7 @@ import kotlin.test.assertNotNull
 
 @Preemptible
 private class SampleAnnotatedServer : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply<Unit>(null, Unit)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
 }

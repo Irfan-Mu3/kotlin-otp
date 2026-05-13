@@ -10,6 +10,7 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.registry.ProcessRegistry
 
 /**
@@ -37,7 +38,7 @@ fun main() {
 }
 
 private fun echoServer() = object : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit) =
         ReplyResult.Reply("echo:$request", state)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(state)

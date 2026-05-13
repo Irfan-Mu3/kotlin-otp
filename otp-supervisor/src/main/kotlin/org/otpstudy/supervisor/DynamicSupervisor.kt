@@ -10,21 +10,34 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
 import org.otpstudy.core.OtpLogging
 import org.otpstudy.core.Restart
 import org.otpstudy.core.Shutdown
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 /**
  * Template for dynamic children: all children share the same restart/shutdown policy
  * and start lambda; each instance gets a distinct [childId].
+ *
+ * The [start] lambda receives [ready]: invoke it **exactly once** when the supervised
+ * resource is usable (e.g. worker linked and running). [DynamicSupervisorRef.startChild]
+ * does not wait for [ready]; [DynamicSupervisorRef.startChildSync] awaits the first
+ * [ready] value (with a timeout) and returns it to the caller while the child coroutine
+ * continues (e.g. `join()` on a worker job).
+ *
+ * **Misuse:** calling [ready] zero times hangs [startChildSync] until timeout; calling it
+ * more than once fails that sync start; throwing before [ready] fails [startChildSync]
+ * with that exception.
  *
  * Analogous to OTP `simple_one_for_one` but extended to support all three strategies
  * ([SupervisorStrategy.OneForOne], [SupervisorStrategy.OneForAll], [SupervisorStrategy.RestForOne]).
@@ -39,10 +52,11 @@ import kotlin.time.Duration.Companion.seconds
  * JVM/OTP difference: OTP's `simple_one_for_one` only supports `one_for_one`. The
  * `one_for_all` and `rest_for_one` semantics here are educational extensions.
  */
-data class SimpleOneForOneTemplate(
+data class SimpleOneForOneTemplate<T>(
     val restart: Restart,
     val shutdown: Shutdown,
-    val start: suspend CoroutineScope.(childId: String) -> Unit,
+    /** [scope] is the dynamic child job's scope; invoke [ready] exactly once when the resource is usable. */
+    val start: suspend (scope: CoroutineScope, childId: String, ready: (T) -> Unit) -> Unit,
 )
 
 data class DynamicChildInfo(
@@ -62,6 +76,22 @@ class DynamicSupervisorRef internal constructor(
         val reply = CompletableDeferred<String>()
         events.send(DynamicSupervisorEvent.StartChild(reply))
         return reply.await()
+    }
+
+    /**
+     * Starts a child and waits until [SimpleOneForOneTemplate.start] invokes [ready] once
+     * with the resource value, then returns [Pair] of [childId] and that value while the
+     * child job keeps running.
+     *
+     * @param timeout bounds how long the coordinator waits for the first [ready] call.
+     * @throws kotlinx.coroutines.TimeoutCancellationException if [ready] is never invoked in time.
+     * @throws IllegalStateException if [ready] is invoked more than once for this start.
+     */
+    suspend fun <T> startChildSync(timeout: Duration = 60.seconds): Pair<String, T> {
+        val reply = CompletableDeferred<Pair<String, Any?>>()
+        events.send(DynamicSupervisorEvent.StartChildSync(timeout, reply))
+        @Suppress("UNCHECKED_CAST")
+        return reply.await() as Pair<String, T>
     }
 
     suspend fun terminateChild(
@@ -102,6 +132,11 @@ internal sealed class DynamicSupervisorEvent {
         val reply: CompletableDeferred<String>,
     ) : DynamicSupervisorEvent()
 
+    data class StartChildSync(
+        val timeout: Duration,
+        val reply: CompletableDeferred<Pair<String, Any?>>,
+    ) : DynamicSupervisorEvent()
+
     data class TerminateChild(
         val id: String,
         val shutdownOverride: Shutdown?,
@@ -127,9 +162,17 @@ internal sealed class DynamicSupervisorEvent {
     ) : DynamicSupervisorEvent()
 }
 
+private sealed class ReadyMode {
+    data object Async : ReadyMode()
+
+    data class Sync(
+        val deferred: CompletableDeferred<Any?>,
+    ) : ReadyMode()
+}
+
 private class DynamicChildSlot(
     val id: String,
-    val template: SimpleOneForOneTemplate,
+    val template: SimpleOneForOneTemplate<*>,
 ) {
     val restartTimestampsNanos: MutableList<Long> = mutableListOf()
     var job: Job? = null
@@ -143,7 +186,7 @@ object DynamicSupervisor {
     fun startLink(
         parent: CoroutineScope,
         flags: SupervisorFlags,
-        template: SimpleOneForOneTemplate,
+        template: SimpleOneForOneTemplate<*>,
         context: CoroutineContext = Dispatchers.Default,
     ): DynamicSupervisorRef {
         val supervisorJob = SupervisorJob(parent.coroutineContext[Job])
@@ -197,8 +240,46 @@ object DynamicSupervisor {
                             val id = "dyn-${idSeq.incrementAndGet()}"
                             val slot = DynamicChildSlot(id, template)
                             children[id] = slot
-                            startDynamicWorker(slot, supervisorScope, events, shuttingDown)
+                            startDynamicWorker(
+                                slot,
+                                supervisorScope,
+                                events,
+                                shuttingDown,
+                                readyMode = ReadyMode.Async,
+                            )
                             event.reply.complete(id)
+                        }
+                        is DynamicSupervisorEvent.StartChildSync -> {
+                            if (shuttingDown.get()) {
+                                event.reply.completeExceptionally(IllegalStateException("shutting down"))
+                                continue
+                            }
+                            val id = "dyn-${idSeq.incrementAndGet()}"
+                            val slot = DynamicChildSlot(id, template)
+                            children[id] = slot
+                            val readyDeferred = CompletableDeferred<Any?>()
+                            startDynamicWorker(
+                                slot,
+                                supervisorScope,
+                                events,
+                                shuttingDown,
+                                readyMode = ReadyMode.Sync(readyDeferred),
+                            )
+                            val job = slot.job!!
+                            try {
+                                val value =
+                                    withTimeout(event.timeout) {
+                                        readyDeferred.await()
+                                    }
+                                event.reply.complete(Pair(id, value))
+                            } catch (t: TimeoutCancellationException) {
+                                job.cancel(t)
+                                event.reply.completeExceptionally(t)
+                            } catch (t: Throwable) {
+                                if (t is CancellationException) throw t
+                                job.cancel(CancellationException("startChildSync failed", t))
+                                event.reply.completeExceptionally(t)
+                            }
                         }
                         is DynamicSupervisorEvent.TerminateChild -> {
                             val slot = children.remove(event.id)
@@ -267,7 +348,7 @@ object DynamicSupervisor {
                             // M5c: apply strategy
                             when (flags.strategy) {
                                 SupervisorStrategy.OneForOne -> {
-                                    startDynamicWorker(slot, supervisorScope, events, shuttingDown)
+                                    startDynamicWorker(slot, supervisorScope, events, shuttingDown, ReadyMode.Async)
                                 }
                                 SupervisorStrategy.OneForAll -> {
                                     // Stop all active children in reverse insertion order
@@ -279,7 +360,7 @@ object DynamicSupervisor {
                                     }
                                     // Restart all children (preserve childIds, re-use template)
                                     for (s in children.values.toList()) {
-                                        startDynamicWorker(s, supervisorScope, events, shuttingDown)
+                                        startDynamicWorker(s, supervisorScope, events, shuttingDown, ReadyMode.Async)
                                     }
                                 }
                                 SupervisorStrategy.RestForOne -> {
@@ -300,7 +381,7 @@ object DynamicSupervisor {
                                     }
                                     // Restart suffix in insertion order
                                     for (s in suffix) {
-                                        startDynamicWorker(s, supervisorScope, events, shuttingDown)
+                                        startDynamicWorker(s, supervisorScope, events, shuttingDown, ReadyMode.Async)
                                     }
                                 }
                             }
@@ -321,16 +402,31 @@ object DynamicSupervisor {
         scope: CoroutineScope,
         events: Channel<DynamicSupervisorEvent>,
         shuttingDown: AtomicBoolean,
+        readyMode: ReadyMode,
     ) {
         val epoch = epochSeq.incrementAndGet()
         slot.startEpoch = epoch
         val id = slot.id
+        @Suppress("UNCHECKED_CAST")
+        val tmpl = slot.template as SimpleOneForOneTemplate<Any?>
         val job =
             scope.launch(CoroutineName("dynamic-child:$id")) {
                 try {
-                    slot.template.start(this, id)
+                    tmpl.start(this, id) { value ->
+                        when (readyMode) {
+                            ReadyMode.Async -> Unit
+                            is ReadyMode.Sync -> {
+                                if (!readyMode.deferred.complete(value)) {
+                                    error("ready invoked more than once for dynamic child $id")
+                                }
+                            }
+                        }
+                    }
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
+                    if (readyMode is ReadyMode.Sync && !readyMode.deferred.isCompleted) {
+                        readyMode.deferred.completeExceptionally(t)
+                    }
                     throw t
                 }
             }

@@ -12,6 +12,7 @@ import org.otpstudy.genserver.InfoMsg
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -19,7 +20,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 private class EventCollectorServer : GenServer<MutableList<NodeEvent>> {
-    override suspend fun init() = InitResult.Ok(mutableListOf<NodeEvent>())
+    override suspend fun init(self: GenServerRef<MutableList<NodeEvent>>) = InitResult.Ok(mutableListOf<NodeEvent>())
     override suspend fun handleCall(request: Any, state: MutableList<NodeEvent>) =
         ReplyResult.Reply<MutableList<NodeEvent>>(state.toList(), state)
     override suspend fun handleCast(request: Any, state: MutableList<NodeEvent>) =

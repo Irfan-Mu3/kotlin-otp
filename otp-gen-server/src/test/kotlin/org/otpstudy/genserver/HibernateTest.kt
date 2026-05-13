@@ -11,7 +11,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 private class HibernatingCounter : GenServer<Long> {
-    override suspend fun init() = InitResult.Ok(0L)
+    override suspend fun init(self: GenServerRef<Long>) = InitResult.Ok(0L)
 
     override suspend fun handleCall(request: Any, state: Long): ReplyResult<Long> = when (request) {
         "get" -> ReplyResult.Reply(state, state)

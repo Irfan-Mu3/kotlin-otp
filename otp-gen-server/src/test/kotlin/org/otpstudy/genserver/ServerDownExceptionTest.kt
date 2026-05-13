@@ -16,13 +16,13 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 private class EchoServer : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply<Unit>(request, Unit)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
 }
 
 private class HangingServer : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit): ReplyResult<Unit> {
         delay(60_000) // never actually replies during test window
         return ReplyResult.Reply(Unit, Unit)

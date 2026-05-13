@@ -11,6 +11,7 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -18,7 +19,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 private class EchoServer : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply<Unit>(request, Unit)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
 }

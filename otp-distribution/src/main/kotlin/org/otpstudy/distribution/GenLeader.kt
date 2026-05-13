@@ -66,7 +66,8 @@ class GenLeaderServer<S>(
         )
     }
 
-    override suspend fun init(): InitResult<LeaderState<S>> {
+    override suspend fun init(self: GenServerRef<LeaderState<S>>): InitResult<LeaderState<S>> {
+        bindRef(self)
         val s = callbacks.init()
         return InitResult.Ok(LeaderState(s, leader = null, isLeader = false))
     }
@@ -106,7 +107,6 @@ object GenLeaders {
     ): GenServerRef<GenLeaderServer.LeaderState<S>> {
         val server = GenLeaderServer(callbacks, localNode, peers)
         val ref = GenServers.startLink(scope, server, name = name)
-        server.bindRef(ref)
         peers.forEach { NodeMonitor.monitorNode(it, ref) }
         ref.cast(LeaderMsg.Elect(exclude = null))
         return ref

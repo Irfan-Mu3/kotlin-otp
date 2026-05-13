@@ -7,13 +7,14 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import kotlin.test.Test
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 
 private class Dummy : GenServer<Unit> {
-    override suspend fun init(): InitResult<Unit> = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>): InitResult<Unit> = InitResult.Ok(Unit)
 
     override suspend fun handleCall(
         request: Any,

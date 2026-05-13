@@ -22,7 +22,7 @@ import kotlin.time.Duration.Companion.seconds
 private class DeferReplyServer : GenServer<String> {
     var savedHandle: ReplyHandle<String>? = null
 
-    override suspend fun init() = InitResult.Ok("idle")
+    override suspend fun init(self: GenServerRef<String>) = InitResult.Ok("idle")
 
     override suspend fun handleCall(request: Any, state: String): ReplyResult<String> =
         ReplyResult.Reply(request, state)
@@ -45,7 +45,7 @@ private class DeferReplyServer : GenServer<String> {
 // ----- §3: sys -----
 
 private class SysTestServer : GenServer<Int> {
-    override suspend fun init() = InitResult.Ok(0)
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
     override suspend fun handleCall(request: Any, state: Int) = ReplyResult.Reply(state, state + 1)
     override suspend fun handleCast(request: Any, state: Int) = NoreplyResult.Noreply(state + 10)
 }
@@ -53,7 +53,7 @@ private class SysTestServer : GenServer<Int> {
 // ----- §4: OtpTimers -----
 
 private class TimerServer : GenServer<MutableList<String>> {
-    override suspend fun init() = InitResult.Ok(mutableListOf<String>())
+    override suspend fun init(self: GenServerRef<MutableList<String>>) = InitResult.Ok(mutableListOf<String>())
     override suspend fun handleCall(request: Any, state: MutableList<String>) = ReplyResult.Reply(state.toList(), state)
     override suspend fun handleCast(request: Any, state: MutableList<String>) = NoreplyResult.Noreply(state)
     override suspend fun handleInfo(msg: InfoMsg, state: MutableList<String>): NoreplyResult<MutableList<String>> {
@@ -65,7 +65,7 @@ private class TimerServer : GenServer<MutableList<String>> {
 // ----- §6: CrashReporter -----
 
 private class CrashingServer : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit): ReplyResult<Unit> =
         throw RuntimeException("intentional crash")
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(state)
@@ -75,7 +75,8 @@ private class CrashingServer : GenServer<Unit> {
 
 private class TrapExitServer : GenServer<MutableList<ExitSignal.Exit>> {
     override val trapExit = true
-    override suspend fun init() = InitResult.Ok(mutableListOf<ExitSignal.Exit>())
+    override suspend fun init(self: GenServerRef<MutableList<ExitSignal.Exit>>) =
+        InitResult.Ok(mutableListOf<ExitSignal.Exit>())
     override suspend fun handleCall(request: Any, state: MutableList<ExitSignal.Exit>) =
         ReplyResult.Reply(state.toList(), state)
     override suspend fun handleCast(request: Any, state: MutableList<ExitSignal.Exit>) =
@@ -92,7 +93,7 @@ private class TrapExitServer : GenServer<MutableList<ExitSignal.Exit>> {
 // ----- §1: Bounded mailbox -----
 
 private class SlowServer : GenServer<Int> {
-    override suspend fun init() = InitResult.Ok(0)
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
     override suspend fun handleCall(request: Any, state: Int): ReplyResult<Int> {
         delay(50.milliseconds)
         return ReplyResult.Reply(state, state + 1)
@@ -234,7 +235,7 @@ class GenServerTest {
         val trapServer = TrapExitServer()
         val trapRef = GenServers.startLink(scope, trapServer, name = "trap")
         val otherServer = object : GenServer<Unit> {
-            override suspend fun init() = InitResult.Ok(Unit)
+            override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
             override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply(Unit, state)
             override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(state)
         }

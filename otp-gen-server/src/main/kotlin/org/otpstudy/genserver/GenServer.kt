@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
@@ -30,6 +31,12 @@ sealed class GenServerMsg {
     class Call(
         val request: Any,
         val reply: CompletableDeferred<Any?>,
+        /**
+         * Suspending caller's [Job], captured **before** [GenServerRef.call]'s [withTimeout] block.
+         * Must not be read from inside the timeout scope: that job completes when the call returns
+         * and is unsuitable for long-lived borrower monitors (e.g. worker pools).
+         */
+        val callerJob: Job? = null,
     ) : GenServerMsg()
 
     data class Cast(val request: Any) : GenServerMsg()
@@ -48,6 +55,8 @@ sealed class GenServerMsg {
  */
 class ReplyHandle<S> internal constructor(
     internal val pending: CompletableDeferred<Any?>,
+    /** Caller [Job] for in-process [GenServerRef.call]; null when unknown. */
+    val callerJob: Job? = null,
 ) {
     /** Complete the caller's reply. Returns false if already completed (caller timed out). */
     fun reply(response: Any?): Boolean = pending.complete(response)
@@ -68,7 +77,11 @@ class ReplyHandle<S> internal constructor(
  * as [ExitSignal.Exit] instead of cancelling this actor's job.
  */
 interface GenServer<S> {
-    suspend fun init(): InitResult<S>
+    /**
+     * Initialises actor state. [self] is the running handle; [GenServerRef.sendInfo] during
+     * init only enqueues — the mailbox loop has not started yet.
+     */
+    suspend fun init(self: GenServerRef<S>): InitResult<S>
 
     suspend fun handleCall(request: Any, state: S): ReplyResult<S>
 
@@ -147,10 +160,13 @@ class GenServerRef<S>(
     val isTrapExit: Boolean,
     internal val queueLen: AtomicInteger = AtomicInteger(0),
 ) {
-    suspend fun <R> call(request: Any, timeout: Duration = 5.seconds): R =
-        withTimeout(timeout) {
+    suspend fun <R> call(request: Any, timeout: Duration = 5.seconds): R {
+        // Capture outside withTimeout: the timeout scope's Job completes when the call returns,
+        // which would otherwise make borrower hooks (e.g. poolboy) fire immediately after checkout.
+        val callerJob = currentCoroutineContext()[Job]
+        return withTimeout(timeout) {
             val reply = CompletableDeferred<Any?>()
-            val msg = GenServerMsg.Call(request, reply)
+            val msg = GenServerMsg.Call(request, reply, callerJob)
             when (mailboxBound?.policy) {
                 OverflowPolicy.CrashSender -> {
                     if (!mailbox.trySend(msg).isSuccess)
@@ -174,6 +190,7 @@ class GenServerRef<S>(
                 deathWatch.dispose()
             }
         }
+    }
 
     fun cast(request: Any) { trySendMsg(GenServerMsg.Cast(request)) }
 
@@ -299,14 +316,19 @@ object GenServers {
         val arenaCtx: CoroutineContext = arena ?: EmptyCoroutineContext
         val queueLen = AtomicInteger(0)
         val jobName = name?.let { CoroutineName("gen_server:$it") } ?: CoroutineName("gen_server:$id")
-        val job = parent.launch(context + jobName + budget + arenaCtx) {
-            try {
-                runLoop(id, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen)
-            } finally {
-                coroutineContext[ActorArena]?.close()
+        val refReady = CompletableDeferred<GenServerRef<S>>()
+        val job =
+            parent.launch(context + jobName + budget + arenaCtx, start = CoroutineStart.LAZY) {
+                try {
+                    val self = refReady.await()
+                    runLoop(id, self, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen)
+                } finally {
+                    coroutineContext[ActorArena]?.close()
+                }
             }
-        }
         val ref = GenServerRef<S>(id, job, mailbox, controlMailbox, sysMailbox, mailboxBound, server.trapExit, queueLen)
+        refReady.complete(ref)
+        job.start()
         val hookReg = GenServerHooks.onActorStart?.invoke {
             ActorSnapshot(id, name, job.isActive, queueLen.get(), budget.totalReductions, server.trapExit,
                 arena?.bytesAllocated ?: 0L)
@@ -344,9 +366,9 @@ object GenServers {
         private val inner: GenServer<S>,
         private val ack: CompletableDeferred<Result<Unit>>,
     ) : GenServer<S> by inner {
-        override suspend fun init(): InitResult<S> {
+        override suspend fun init(self: GenServerRef<S>): InitResult<S> {
             return try {
-                val result = inner.init()
+                val result = inner.init(self)
                 when (result) {
                     is InitResult.Ok   -> ack.complete(Result.success(Unit))
                     is InitResult.Stop -> ack.complete(Result.failure(InitFailedException(result.reason)))
@@ -367,6 +389,7 @@ object GenServers {
 
     private suspend fun <S> runLoop(
         id: OtpProcessId,
+        self: GenServerRef<S>,
         server: GenServer<S>,
         mailbox: Channel<GenServerMsg>,
         controlMailbox: Channel<InfoMsg>,
@@ -376,7 +399,7 @@ object GenServers {
         queueLen: AtomicInteger,
     ) {
         var currentServer = server
-        var state: S = when (val init = currentServer.init()) {
+        var state: S = when (val init = currentServer.init(self)) {
             is InitResult.Ok -> init.state
             is InitResult.Stop -> {
                 OtpLogging.log(OtpLogLevel.Info,
@@ -470,7 +493,7 @@ object GenServers {
                     is GenServerMsg.Info -> applyNoreply(currentServer.handleInfo(wakeMsg.msg, state))
                     GenServerMsg.Stop -> { currentServer.terminate(TerminateReason.Shutdown, state); true }
                     is GenServerMsg.Call -> {
-                        val handle = ReplyHandle<S>(wakeMsg.reply)
+                        val handle = ReplyHandle<S>(wakeMsg.reply, wakeMsg.callerJob)
                         try {
                             when (val cr = currentServer.handleCallFrom(wakeMsg.request, state, handle)) {
                                 is ReplyResult.Reply<*> -> {
@@ -557,7 +580,7 @@ object GenServers {
                 // 4. Process user message
                 when (msg) {
                     is GenServerMsg.Call -> {
-                        val handle = ReplyHandle<S>(msg.reply)
+                        val handle = ReplyHandle<S>(msg.reply, msg.callerJob)
                         try {
                             when (val r = currentServer.handleCallFrom(msg.request, state, handle)) {
                                 is ReplyResult.Reply<*> -> {

@@ -10,6 +10,7 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.registry.ProcessRegistry
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -17,14 +18,14 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 
 private class AppupCounterV1 : GenServer<Long> {
-    override suspend fun init() = InitResult.Ok(0L)
+    override suspend fun init(self: GenServerRef<Long>) = InitResult.Ok(0L)
     override suspend fun handleCall(request: Any, state: Long) = ReplyResult.Reply<Long>(state, state)
     override suspend fun handleCast(request: Any, state: Long) = NoreplyResult.Noreply(state + 1)
     override suspend fun codeChange(oldVersion: String, newVersion: String, state: Long): Long = state * 2
 }
 
 private class AppupCounterV2 : GenServer<Long> {
-    override suspend fun init() = InitResult.Ok(0L)
+    override suspend fun init(self: GenServerRef<Long>) = InitResult.Ok(0L)
     override suspend fun handleCall(request: Any, state: Long) = ReplyResult.Reply<Long>(state, state)
     override suspend fun handleCast(request: Any, state: Long) = NoreplyResult.Noreply(state + 10)
     override suspend fun codeChange(oldVersion: String, newVersion: String, state: Long): Long = state * 2

@@ -16,19 +16,19 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 private class OkServer : GenServer<Int> {
-    override suspend fun init() = InitResult.Ok(0)
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
     override suspend fun handleCall(request: Any, state: Int) = ReplyResult.Reply<Int>(state, state)
     override suspend fun handleCast(request: Any, state: Int) = NoreplyResult.Noreply(state + 1)
 }
 
 private class StopOnInitServer(val reason: TerminateReason = TerminateReason.Normal) : GenServer<Unit> {
-    override suspend fun init() = InitResult.Stop(reason)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Stop(reason)
     override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply<Unit>(null, Unit)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
 }
 
 private class CrashOnInitServer : GenServer<Unit> {
-    override suspend fun init(): InitResult<Unit> = throw RuntimeException("init boom")
+    override suspend fun init(self: GenServerRef<Unit>): InitResult<Unit> = throw RuntimeException("init boom")
     override suspend fun handleCall(request: Any, state: Unit) = ReplyResult.Reply<Unit>(null, Unit)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
 }
@@ -96,7 +96,7 @@ class ProcLibTest {
         val arenaDeferred = CompletableDeferred<org.otpstudy.memory.ActorArena?>()
 
         class ArenaProbeServer : GenServer<Unit> {
-            override suspend fun init(): InitResult<Unit> {
+            override suspend fun init(self: GenServerRef<Unit>): InitResult<Unit> {
                 arenaDeferred.complete(currentCoroutineContext()[org.otpstudy.memory.ActorArena])
                 return InitResult.Stop(TerminateReason.Normal)
             }
@@ -115,7 +115,7 @@ class ProcLibTest {
         val arenaDeferred = CompletableDeferred<org.otpstudy.memory.ActorArena?>()
 
         class ArenaProbeServer : GenServer<Unit> {
-            override suspend fun init(): InitResult<Unit> {
+            override suspend fun init(self: GenServerRef<Unit>): InitResult<Unit> {
                 arenaDeferred.complete(currentCoroutineContext()[org.otpstudy.memory.ActorArena])
                 return InitResult.Stop(TerminateReason.Normal)
             }

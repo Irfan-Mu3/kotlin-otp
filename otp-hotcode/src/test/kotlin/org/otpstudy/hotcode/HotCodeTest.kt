@@ -11,6 +11,7 @@ import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -18,7 +19,7 @@ import kotlin.test.assertEquals
 
 // --- V1: counter that increments by 1 ---
 private class CounterV1 : GenServer<Int> {
-    override suspend fun init() = InitResult.Ok(0)
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
     override suspend fun handleCall(request: Any, state: Int) =
         ReplyResult.Reply(state, state)
     override suspend fun handleCast(request: Any, state: Int) =
@@ -31,7 +32,7 @@ private class CounterV1 : GenServer<Int> {
 
 // --- V2: counter that increments by 2; codeChange doubles the inherited state ---
 private class CounterV2 : GenServer<Int> {
-    override suspend fun init() = InitResult.Ok(0)
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
     override suspend fun handleCall(request: Any, state: Int) =
         ReplyResult.Reply(state, state)
     override suspend fun handleCast(request: Any, state: Int) =

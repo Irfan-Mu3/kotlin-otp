@@ -8,6 +8,7 @@ import org.otpstudy.core.OtpProcessId
 import org.otpstudy.ets.OtpTableRegistry
 import org.otpstudy.ets.TableType
 import org.otpstudy.genserver.*
+import org.otpstudy.genserver.GenServerRef
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -19,7 +20,7 @@ class OtpObserverTest {
     fun `inspectProcess returns current state via sys`() = runTest {
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         val server = object : GenServer<String> {
-            override suspend fun init() = InitResult.Ok("observed-state")
+            override suspend fun init(self: GenServerRef<String>) = InitResult.Ok("observed-state")
             override suspend fun handleCall(r: Any, s: String) = ReplyResult.Reply(s, s)
             override suspend fun handleCast(r: Any, s: String) = NoreplyResult.Noreply(s)
         }

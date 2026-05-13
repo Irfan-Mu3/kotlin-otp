@@ -10,6 +10,7 @@ import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyResult
+import org.otpstudy.genserver.GenServerRef
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.extension.ExtendWith
@@ -19,7 +20,7 @@ import kotlin.test.assertNull
 import kotlin.time.Duration.Companion.seconds
 
 private fun echoServer() = object : GenServer<Unit> {
-    override suspend fun init() = InitResult.Ok(Unit)
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
     override suspend fun handleCall(request: Any, state: Unit) =
         ReplyResult.Reply("echo:$request", state)
     override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(state)
@@ -49,7 +50,7 @@ class NodeTest {
         val scope = CoroutineScope(coroutineContext + SupervisorJob())
         val node = LocalNode(NodeId("cast-node"))
         val server = object : GenServer<MutableList<Any>> {
-            override suspend fun init() = InitResult.Ok(mutableListOf<Any>())
+            override suspend fun init(self: GenServerRef<MutableList<Any>>) = InitResult.Ok(mutableListOf<Any>())
             override suspend fun handleCall(r: Any, s: MutableList<Any>) =
                 ReplyResult.Reply(s.toList(), s)
             override suspend fun handleCast(r: Any, s: MutableList<Any>): NoreplyResult<MutableList<Any>> {

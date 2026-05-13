@@ -31,6 +31,7 @@ This Kotlin layout **does not** reproduce the BEAM. It ports **OTP-shaped struct
 
 ## Other notes
 
+- **JUnit 5 `@Test` return type:** a test method whose body is an expression (for example `fun x() = runBlocking { … }` or `fun x(): Unit = runBlocking { assertNotNull(foo) }`) must be declared to return **`Unit`**. If the last expression is not `Unit` (for example `assertNotNull` returns the asserted value), the JVM signature is **`T method()`** with `T ≠ void`, and **JUnit Jupiter silently ignores** the method — it never appears as skipped; it simply does not run. Prefer `fun x(): Unit = runBlocking { …; Unit }` or a block body ending with `Unit` on its own line.
 - **Dynamic supervisors:** [`DynamicSupervisor`](otp-supervisor/src/main/kotlin/org/otpstudy/supervisor/DynamicSupervisor.kt) implements `simple_one_for_one`-style dynamic children only under [`SupervisorStrategy.OneForOne`](otp-supervisor/src/main/kotlin/org/otpstudy/supervisor/SupervisorFlags.kt).
 - **Links/monitors** in [`ProcessMonitor`](otp-core/src/main/kotlin/org/otpstudy/core/ProcessMonitor.kt) are not VM-level; install an [`OtpLogger`](otp-core/src/main/kotlin/org/otpstudy/core/OtpLog.kt) via `OtpLogging.setLogger` for correlation in logs.
 
