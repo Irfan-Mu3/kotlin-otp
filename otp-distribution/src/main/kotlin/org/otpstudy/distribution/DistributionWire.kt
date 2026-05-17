@@ -1,6 +1,6 @@
 package org.otpstudy.distribution
 
-import org.otpstudy.genserver.GenServerRef
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -9,19 +9,29 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.serializer
 
 /**
  * JSON payloads on the Kotlin dist wire. Primitives and [JsonElement] are supported; for structured
- * application data prefer building a [JsonObject] / [JsonArray] (or encode to string) at the edge.
+ * application data use [@Serializable] types via [encodeSerializable] / [decodeSerializable].
  */
-internal object DistributionWire {
-    val json = Json {
-        classDiscriminator = "type"
-        ignoreUnknownKeys = true
-        encodeDefaults = true
-    }
+object DistributionWire {
+    val json: Json =
+        Json {
+            classDiscriminator = "type"
+            ignoreUnknownKeys = true
+            encodeDefaults = true
+        }
+
+    inline fun <reified T : Any> encodeSerializable(value: T): JsonElement =
+        json.encodeToJsonElement(json.serializersModule.serializer<T>(), value)
+
+    inline fun <reified T : Any> decodeSerializable(el: JsonElement): T =
+        json.decodeFromJsonElement(json.serializersModule.serializer<T>(), el)
 
     fun encodePayload(value: Any?): JsonElement =
         when (value) {
@@ -33,7 +43,15 @@ internal object DistributionWire {
             is Long -> JsonPrimitive(value)
             is Float -> JsonPrimitive(value)
             is Double -> JsonPrimitive(value)
-            else -> JsonPrimitive(value.toString())
+            else -> encodeSerializableOrToString(value)
+        }
+
+    private fun encodeSerializableOrToString(value: Any): JsonElement =
+        try {
+            @Suppress("UNCHECKED_CAST")
+            json.encodeToJsonElement(value as Any)
+        } catch (_: SerializationException) {
+            JsonPrimitive(value.toString())
         }
 
     fun decodePayload(el: JsonElement): Any? =
@@ -48,12 +66,8 @@ internal object DistributionWire {
             is JsonArray, is JsonObject -> el
         }
 
-    /**
-     * Maps decoded wire values to something [GenServerRef.cast] / [call] accept (`Any`, not `Any?`).
-     * JSON `null` becomes [Unit].
-     */
+    /** Maps decoded wire values to something actors accept (`Any`, not `Any?`). JSON `null` → [Unit]. */
     fun asGenServerPayload(decoded: Any?): Any = decoded ?: Unit
 
-    /** [decodePayload] then [asGenServerPayload] — single entry for inbound frames to actors. */
     fun decodeGenServerPayload(el: JsonElement): Any = asGenServerPayload(decodePayload(el))
 }

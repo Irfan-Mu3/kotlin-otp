@@ -4,7 +4,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import org.otpstudy.distribution.InMemoryTransport
+import org.otpstudy.distribution.LocalNode
+import org.otpstudy.distribution.NodeId
+import org.otpstudy.distribution.RemoteGenServerRef
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
@@ -109,6 +115,74 @@ class GlobalRegistryTest {
         ref.job.join()
         assertNull(GlobalRegistry.whereisName<Unit>("dying"))
     }
+
+    @Test
+    fun register_replicates_to_peer(): Unit =
+        runBlocking {
+            val suffix = System.nanoTime().toString()
+            val nodeA = LocalNode(NodeId("ga-$suffix", "global"))
+            val nodeB = LocalNode(NodeId("gb-$suffix", "global"))
+            val transport = InMemoryTransport()
+            transport.addNode(nodeA)
+            transport.addNode(nodeB)
+            GlobalRegistry.install(transport, nodeA)
+            GlobalRegistry.useNode(nodeB)
+            transport.connect(nodeA, nodeB)
+            val ref = GenServers.startLink(scope, NoopServer())
+            GlobalRegistry.useNode(nodeA)
+            GlobalRegistry.registerName("shared", ref)
+            delay(20)
+            GlobalRegistry.useNode(nodeB)
+            val resolved = GlobalRegistry.resolveName("shared")
+            assertTrue(resolved is GlobalRegistry.NameResolution.RemoteRef)
+            Unit
+        }
+
+    @Test
+    fun whereis_on_peer_returns_remote_stub(): Unit =
+        runBlocking {
+            val suffix = System.nanoTime().toString()
+            val nodeA = LocalNode(NodeId("wa-$suffix", "global"))
+            val nodeB = LocalNode(NodeId("wb-$suffix", "global"))
+            val transport = InMemoryTransport()
+            transport.addNode(nodeA)
+            transport.addNode(nodeB)
+            GlobalRegistry.install(transport, nodeA)
+            GlobalRegistry.useNode(nodeB)
+            transport.connect(nodeA, nodeB)
+            val ref = GenServers.startLink(scope, NoopServer())
+            GlobalRegistry.useNode(nodeA)
+            GlobalRegistry.registerName("svc", ref)
+            delay(20)
+            GlobalRegistry.useNode(nodeB)
+            val resolved = GlobalRegistry.resolveName("svc")
+            assertTrue(resolved is GlobalRegistry.NameResolution.RemoteRef)
+            assertTrue((resolved as GlobalRegistry.NameResolution.RemoteRef).stub is RemoteGenServerRef)
+            Unit
+        }
+
+    @Test
+    fun unregister_replicates(): Unit =
+        runBlocking {
+            val suffix = System.nanoTime().toString()
+            val nodeA = LocalNode(NodeId("ua-$suffix", "global"))
+            val nodeB = LocalNode(NodeId("ub-$suffix", "global"))
+            val transport = InMemoryTransport()
+            transport.addNode(nodeA)
+            transport.addNode(nodeB)
+            GlobalRegistry.install(transport, nodeA)
+            GlobalRegistry.useNode(nodeB)
+            transport.connect(nodeA, nodeB)
+            val ref = GenServers.startLink(scope, NoopServer())
+            GlobalRegistry.useNode(nodeA)
+            GlobalRegistry.registerName("gone", ref)
+            delay(20)
+            GlobalRegistry.unregisterName("gone")
+            delay(20)
+            GlobalRegistry.useNode(nodeB)
+            assertNull(GlobalRegistry.resolveName("gone"))
+            Unit
+        }
 
     @Test
     fun `registeredNames returns all names`() = runTest {

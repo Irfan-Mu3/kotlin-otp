@@ -584,16 +584,18 @@ object GenServers {
                         try {
                             when (val r = currentServer.handleCallFrom(msg.request, state, handle)) {
                                 is ReplyResult.Reply<*> -> {
+                                    @Suppress("UNCHECKED_CAST") val ns = r.newState as S
+                                    state = ns
                                     if (!msg.reply.isCompleted) msg.reply.complete(r.response)
-                                    @Suppress("UNCHECKED_CAST") val ns = r.newState as S; state = ns
                                 }
                                 is ReplyResult.DeferReply<*> -> {
                                     @Suppress("UNCHECKED_CAST") val ns = r.newState as S; state = ns
                                     // caller's deferred is completed later via handle.reply()
                                 }
                                 is ReplyResult.Stop<*> -> {
+                                    @Suppress("UNCHECKED_CAST") val ns = r.newState as S
+                                    state = ns
                                     if (!msg.reply.isCompleted) msg.reply.complete(r.response)
-                                    @Suppress("UNCHECKED_CAST") val ns = r.newState as S; state = ns
                                     currentServer.terminate(r.reason, state)
                                     break
                                 }

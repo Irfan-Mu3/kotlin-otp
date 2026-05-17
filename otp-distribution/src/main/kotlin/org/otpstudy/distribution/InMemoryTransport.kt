@@ -16,6 +16,10 @@ import kotlin.time.Duration
  */
 class InMemoryTransport : NodeTransport {
     private val nodes = ConcurrentHashMap<NodeId, LocalNode>()
+    private val connected = ConcurrentHashMap.newKeySet<NodeId>()
+
+    /** Set by [org.otpstudy.global.GlobalRegistry.install] for global replication fan-out. */
+    var replicationSource: NodeId? = null
 
     fun addNode(node: LocalNode) {
         nodes[node.id] = node
@@ -28,8 +32,12 @@ class InMemoryTransport : NodeTransport {
     fun connect(a: LocalNode, b: LocalNode) {
         nodes[a.id] = a
         nodes[b.id] = b
+        connected.add(a.id)
+        connected.add(b.id)
         NodeMonitor.notifyUp(a.id)
         NodeMonitor.notifyUp(b.id)
+        GlobalReplicationBus.onPeerConnected?.invoke(b.id)
+        GlobalReplicationBus.onPeerConnected?.invoke(a.id)
     }
 
     /**
@@ -58,5 +66,14 @@ class InMemoryTransport : NodeTransport {
         val node = nodes[targetNode]
             ?: throw IllegalStateException("unknown node: $targetNode")
         return node.call<Any?>(targetName, request, timeout)
+    }
+
+    override suspend fun broadcastGlobal(msg: GlobalDistMsg) {
+        val from = replicationSource ?: return
+        for (peer in connected) {
+            if (peer != from) {
+                GlobalReplicationBus.handler?.onMessage(msg, from)
+            }
+        }
     }
 }

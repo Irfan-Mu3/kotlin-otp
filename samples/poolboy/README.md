@@ -11,7 +11,7 @@ Erlang sources mirrored, line-for-line where possible:
 ## Run it
 
 ```
-./gradlew :samples:poolboy:test           # 18-test matrix (~0.6s)
+./gradlew :samples:poolboy:test           # 33-test matrix (~1s)
 ./gradlew :samples:poolboy:run            # ExampleApp main: starts pool1+pool2, runs SQL, stops cleanly
 ```
 
@@ -19,12 +19,17 @@ Erlang sources mirrored, line-for-line where possible:
 
 | File | Mirror of | Purpose |
 |------|-----------|---------|
-| [`Poolboy.kt`](src/main/kotlin/org/otpstudy/poolboy/Poolboy.kt) | `poolboy:start_link/1,2`, `WorkerFactory` | Public entry point + `PoolRef` handle |
+| [`Poolboy.kt`](src/main/kotlin/org/otpstudy/poolboy/Poolboy.kt) | `poolboy:start_link/1,2`, `checkout/1–3`, `WorkerFactory` | Public entry point, `PoolRef`, `resolve`, top-level `checkout`/`transaction` |
+| [`PoolHandle.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolHandle.kt) | `poolboy:checkout`, `transaction` | Shared local + remote pool API |
+| [`PoolAddress.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) | `poolboy:pool()` type | `{local, Name}`, `{Name, Node}`, `{global, Name}`, `{via, …}` |
+| [`RemotePoolHandle.kt`](src/main/kotlin/org/otpstudy/poolboy/RemotePoolHandle.kt) | remote `gen_server:call` to pool | Pool RPCs via [`NodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/NodeTransport.kt) |
 | [`PoolGenServer.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolGenServer.kt) | `poolboy.erl` `init` / `handle_call` / `handle_cast` / `handle_info` / `terminate` | The pool actor |
-| [`PoolMessages.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) | `#state{}` record, request tuples | Typed request / cast / info messages, `PoolStatus` |
+| [`PoolMessages.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) | `#state{}` record, request tuples | Typed request / cast / info messages, `PoolStatus`, `PoolStoppedException` |
 | [`example/ExampleWorker.kt`](src/main/kotlin/org/otpstudy/poolboy/example/ExampleWorker.kt) | `example_worker.erl` | H2 JDBC worker `GenServer` |
 | [`example/ExampleApp.kt`](src/main/kotlin/org/otpstudy/poolboy/example/ExampleApp.kt) | `example.erl`, `example.app` | Two-pool `SupervisorApplication` + `main` |
-| [`PoolboyTest.kt`](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt) | poolboy `test/poolboy_tests.erl` (subset) | 12-test matrix |
+| [`PoolWire.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) | — | `@Serializable` pool RPC payloads for TCP |
+| [`PooledWorker.kt`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) | remote pid + `gen_server:call` | `LocalPooledWorker` / `RemotePooledWorker` handles |
+| [`PoolboyTest.kt`](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt) | poolboy `test/poolboy_tests.erl` (subset) | 33-test matrix |
 
 ## Erlang → Kotlin mapping
 
@@ -46,10 +51,15 @@ Erlang sources mirrored, line-for-line where possible:
 | `gen_server:cast(Pool, {cancel_waiting, CRef})` on call timeout | `ref.cast(PoolCast.CancelWaiting(cref))` from the `try/catch` in `PoolRef.checkout` | |
 | `application:get_env(example, pools)` | [`ApplicationEnv.require<List<PoolDef>>("pools")`](../../otp-application/src/main/kotlin/org/otpstudy/application/ApplicationEnv.kt) | Typed facade — no global process dictionary |
 | `epgsql:connect/4` + `epgsql:squery/2` + `epgsql:equery/3` | `DriverManager.getConnection` + `Statement.execute` + `PreparedStatement.execute` | H2 in-memory; pure Java |
+| `pool()` — local name | [`PoolAddress.Local`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) → [`GlobalProcessRegistry`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ProcessRegistry.kt) | Same JVM |
+| `pool()` — `{Name, Node}` | [`PoolAddress.OnNode`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) + [`LocalNode.register`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/LocalNode.kt) on `homeNode` | [`RemotePoolHandle`](src/main/kotlin/org/otpstudy/poolboy/RemotePoolHandle.kt) + [`KotlinNodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/KotlinNodeTransport.kt) (TCP loopback tests) or [`InMemoryTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/InMemoryTransport.kt) |
+| `pool()` — `{global, Name}` | [`PoolAddress.Global`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) → [`GlobalRegistry`](../../otp-global/src/main/kotlin/org/otpstudy/global/GlobalRegistry.kt) | Wire-replicated via [`DistMsg.Global`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistMsg.kt); remote hits use [`RemoteGenServerRef`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/RemoteGenServerRef.kt) |
+| BEAM remote pid after checkout | [`PooledWorker`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) + [`PoolRequest.ForwardCall`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) | Cross-JVM: [`WorkerToken`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) + forward through home pool — not a distributable [`GenServerRef`](../../otp-gen-server/src/main/kotlin/org/otpstudy/genserver/GenServer.kt) |
+| `pool()` — `{via, Mod, Name}` | [`PoolAddress.Via`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) + [`ViaRegistry`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ViaRegistry.kt) | [`ProcessResolver`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ProcessResolver.kt) instead of an atom module name |
 
 ## Test matrix
 
-18 tests (all green, ~0.6s, see [PoolboyTest.kt](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt)):
+33 tests (all green, ~1s, see [PoolboyTest.kt](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt)):
 
 Core poolboy behaviour:
 
@@ -80,6 +90,35 @@ Robustness / API contract (added round 2):
 | 18a | `unknown_call_does_not_crash_pool` | An unknown `call` payload returns `null` (logged, not raised) instead of crashing the gen_server |
 | 18b | `unknown_cast_does_not_crash_pool` | An unknown `cast` payload is logged and ignored — pool keeps serving |
 
+Performance + ergonomics (added round 3, after upstream coordinator fix):
+
+| # | Test | Asserts |
+|---|------|---------|
+| 19 | `parallel_init_spawns_workers_concurrently` | 5 workers × 200ms `init` each → `Poolboy.startLink` completes in < 600ms (would be > 1s if pool init were serial). Uses a synthetic `startLinkSync` factory so the spawn round-trip blocks on the worker's `init` |
+| 20 | `parallel_init_propagates_first_failure_and_rolls_back` | Factory throws on the 3rd of 5 parallel spawns; `startLink` rethrows; structured-concurrency cancels in-flight siblings; `Poolboy.startLink`'s catch shuts down the dyn supervisor — no leaked children under `parent`; subsequent `startLink` on the same scope works |
+| 21 | `checkout_on_stopped_pool_throws_pool_stopped_exception` | After `pool.stop()`, `pool.checkout()` and `pool.status()` both throw `PoolStoppedException` with the pool name, wrapping the underlying `ServerDownException` as `cause` |
+| 22 | `transaction_on_stopped_pool_throws_pool_stopped_exception` | `pool.transaction { … }` on a stopped pool throws `PoolStoppedException`, not the previous "pool returned null worker" / raw `ServerDownException` leak |
+
+Distribution addressing (round 4):
+
+| # | Test | Asserts |
+|---|------|---------|
+| 23 | `pool_resolvable_via_local_node` | Pool on node A registered on [`LocalNode`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/LocalNode.kt); node B resolves via [`PoolAddress.OnNode`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) + [`InMemoryTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/InMemoryTransport.kt) → `status()` |
+| 24 | `pool_checkout_via_remote_node_inmemory` | Remote checkout returns a worker; `worker.call` works (same JVM) |
+| 25 | `pool_global_registry_resolution` | [`PoolAddress.Global`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) + [`GlobalRegistry.registerName`](../../otp-global/src/main/kotlin/org/otpstudy/global/GlobalRegistry.kt) |
+| 26 | `pool_via_registry_resolution` | [`PoolAddress.Via`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) + [`MapViaRegistry`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ViaRegistry.kt) |
+| 27 | `remote_checkout_surfaces_pool_stopped` | After `pool.stop()` on home node, remote `checkout` throws [`PoolStoppedException`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) |
+
+TCP + global replication (round 5, kotlin-otp-only — no BEAM/jinterface):
+
+| # | Test | Asserts |
+|---|------|---------|
+| — | `pool_wire_roundtrip` | [`DistributionWire.encodeSerializable`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistributionWire.kt) round-trips [`WirePoolRequest`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) / [`WireCheckoutResult`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) |
+| 28 | `pool_checkout_via_tcp_loopback` | Two [`KotlinNodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/KotlinNodeTransport.kt)s; remote checkout → [`RemotePooledWorker.call`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) |
+| 29 | `pool_status_via_tcp_loopback` | Remote `status()` over TCP |
+| 30 | `tcp_checkin_returns_worker_to_pool` | Checkout → call → token checkin → second checkout |
+| 31 | `pool_global_via_tcp_loopback` | [`GlobalRegistry.install`](../../otp-global/src/main/kotlin/org/otpstudy/global/GlobalRegistry.kt) + [`PoolAddress.Global`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt) over TCP |
+
 ## kotlin-otp integration notes (poolboy alpha)
 
 These items were tightened while porting poolboy; they are **implemented** in-tree now (see [`CHANGELOG.md`](../../CHANGELOG.md) for breaking-change notes).
@@ -100,37 +139,43 @@ Round 2 was poolboy-only — none of these required touching `otp-*`. They turn 
 5. **Unknown `call` / `cast` payloads no longer crash the pool** — `handleCallFrom` replies with `null` (matching OTP `{reply, {error, invalid_message}, State}` discipline), `handleCast` is a no-op; both log via `OtpLogging`. Tests: `unknown_call_does_not_crash_pool`, `unknown_cast_does_not_crash_pool`.
 6. **O(1) cref → worker lookup** — `PoolState.crefIndex: MutableMap<CheckoutRef, GenServerRef<W>>` kept in sync with `monitors` so `BorrowerDown` and `cancel_waiting` paths no longer scan the full `monitors` table. No behaviour change at small `size`; matters for pools of thousands.
 
-## kotlin-otp papercuts surfaced by round 2 (deferred)
+## Round-3 hardening (after upstream coordinator fix)
 
-These were noticed while writing the round-2 hardening tests. They are real and reproducible, but fixing them belongs in `otp-*` (separate round, not in scope for this poolboy delta):
+The two kotlin-otp papercuts surfaced by round 2 (`startChildSync` coordinator serialization + template-exception stderr leak) have been **fixed upstream** in `otp-supervisor`. Round 3 builds on that fix to take two more wins in the poolboy sample, again entirely inside `samples/poolboy/`:
 
-1. **`DynamicSupervisor.startChildSync` serializes at the coordinator.** The supervisor coordinator is a single coroutine that suspends on `withTimeout { readyDeferred.await() }` *inside its main `for (event in events)` loop* while a `StartChildSync` event is in flight. Consequence: `coroutineScope { repeat(50) { launch { dynSup.startChildSync() } } }` runs 50× **sequentially**, defeating any attempt to parallelise pool warmup. Suggested fix: when handling `StartChildSync`, register the deferred against the slot and continue the coordinator loop; complete it later from a `ChildReady` event posted by the worker. This unlocks parallel `init` for poolboy (and a real cold-start win for size-50+ pools).
+7. **Parallel worker pre-population in `PoolGenServer.init`.** `init` now uses `coroutineScope { (0 until size).map { async { workerHandler.spawn() } }.awaitAll() }` instead of a serial `repeat(size) { spawn() }`. Erlang poolboy's `prepopulate/3` is **serial**; this is a deliberate Kotlin win once `startChildSync` no longer blocks the coordinator. The win is observable when the user's `WorkerFactory` blocks on the worker's `init` — which is the right default for resource-holding workers like DB connections, and which the included [`ExampleWorker.factory`](src/main/kotlin/org/otpstudy/poolboy/example/ExampleWorker.kt) now does (it uses `GenServers.startLinkSync`, so JDBC connection failures surface at `Poolboy.startLink` time and a 50-worker pool warms up in roughly the time of a single connection). On failure, structured concurrency cancels in-flight siblings and `Poolboy.startLink`'s existing catch shuts down the dyn supervisor — no behaviour change for the failure path. Tests: `parallel_init_spawns_workers_concurrently`, `parallel_init_propagates_first_failure_and_rolls_back`.
+8. **`PoolStoppedException`.** A new public exception type wraps `ServerDownException` from `PoolRef.checkout` / `PoolRef.status` / `PoolRef.transaction` after the pool has stopped. Carries the pool name and preserves the underlying cause. Lets callers catch "pool is gone" without depending on kotlin-otp's internal exception types. Tests: `checkout_on_stopped_pool_throws_pool_stopped_exception`, `transaction_on_stopped_pool_throws_pool_stopped_exception`.
 
-2. **Exceptions thrown by `SimpleOneForOneTemplate.start` propagate to the global coroutine exception handler.** When the worker factory inside `start` throws, the supervisor *correctly* propagates the failure to `startChildSync`'s caller via `reply.completeExceptionally(t)` — but the same exception also escapes the child `launch` (which has a `SupervisorJob` parent that doesn't trap it) and ends up printed to `stderr` by the default Kotlin handler. Visible in `init_failure_does_not_leak_supervisor`'s `system-err` output. Suggested fix: wrap the child launch's body in `try { ... } catch (t: Throwable) { /* the deferred carries this; do not rethrow */ }` once the deferred has been completed exceptionally.
+## kotlin-otp papercuts surfaced by round 2 (now resolved upstream)
 
-## Documented follow-ups (deferred)
+Both items below were originally "out of scope, fix in `otp-*`". They were addressed in a follow-up round to `otp-supervisor`; documented here as the historical record of what this port surfaced:
 
-The original `poolboy:pool()` type allows three more registration variants we did not port — these test kotlin-otp's distribution layer rather than poolboy itself. Add when the distribution layer exits alpha:
+1. **`DynamicSupervisor.startChildSync` serialized at the coordinator.** The supervisor coordinator suspended on `withTimeout { readyDeferred.await() }` *inside its main event loop* while a `StartChildSync` event was in flight, defeating concurrent sync starts. **Fix landed:** the ready handshake is offloaded to a `supervisorScope.launch` that posts a `StartChildSyncAwaitResult` event back to the coordinator. The coordinator stays responsive; concurrent `startChildSync` calls genuinely parallelize. New observable failure mode: `startChildSync` in flight during `dynSup.shutdown()` now completes with `IllegalStateException("shutting down")` instead of hanging.
+2. **Exceptions thrown by `SimpleOneForOneTemplate.start` leaked to stderr.** Failure was correctly delivered to `startChildSync`'s caller via `reply.completeExceptionally(t)`, but the same exception also escaped the child `launch` (parented by a `SupervisorJob`) and ended up printed to `stderr` by the default Kotlin handler. **Fix landed:** when the sync deferred wins the `completeExceptionally` race, the child returns from its `launch` body without rethrowing; a slot-flag guard (`lastSyncStartFailedEpoch`) prevents the resulting `ChildExited(Normal)` from triggering a `Restart.Permanent` loop, regardless of whether the await-result event or the exit event reaches the coordinator first.
 
-- **`{Name, node()}`** — call a locally-named pool on a different JVM node. Two `LocalNode`s wired through [`InMemoryTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/InMemoryTransport.kt) is the minimal in-process test; full fidelity uses [`KotlinNodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/KotlinNodeTransport.kt) over loopback TCP.
-- **`{global, GlobalName}`** — same as above but registered in `GlobalProcessRegistry` rather than addressed by name + node.
-- **`{via, Module, Name}`** — a pluggable-registry escape hatch (gproc / syn equivalent). Needs a kotlin-otp change first: there's no `interface ViaRegistry { register/whereis/unregister }` today.
+## Round 4 — distribution addressing
 
-Suggested test sketch for `{global, ...}`:
+Mirrors the remaining `poolboy:pool()` registration variants. Implemented in `samples/poolboy/` plus a small [`otp-registry`](../../otp-registry) addition:
 
-```kotlin
-@Test
-fun pool_callable_via_global_registry(): Unit = runBlocking {
-    val nodeA = LocalNode("a@localhost")
-    val nodeB = LocalNode("b@localhost")
-    val transport = InMemoryTransport().also { it.connect(nodeA, nodeB) }
+1. **[`PoolAddress`](src/main/kotlin/org/otpstudy/poolboy/PoolAddress.kt)** — `Local`, `OnNode`, `Global`, `Via(ProcessResolver, name)`.
+2. **[`PoolHandle`](src/main/kotlin/org/otpstudy/poolboy/PoolHandle.kt)** — shared `checkout` / `checkin` / `status` / `stop` / `transaction` for [`PoolRef`](src/main/kotlin/org/otpstudy/poolboy/Poolboy.kt) (local) and [`RemotePoolHandle`](src/main/kotlin/org/otpstudy/poolboy/RemotePoolHandle.kt).
+3. **[`Poolboy.resolve`](src/main/kotlin/org/otpstudy/poolboy/Poolboy.kt)** + top-level `Poolboy.checkout` / `checkin` / `status` / `transaction` — OTP-style entry points without holding a `PoolRef`.
+4. **`homeNode: LocalNode?` on `startLink`** — when set with a `name`, registers the pool gen_server on that node's registry so `{Name, Node}` works.
+5. **[`ViaRegistry`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ViaRegistry.kt)** + [`MapViaRegistry`](../../otp-registry/src/main/kotlin/org/otpstudy/registry/ViaRegistry.kt) — `{via, …}` escape hatch (no gproc/syn port).
 
-    val pool = Poolboy.startLink(this, PoolConfig(size = 1, name = "global-pool"), testFactory())
-    // assert nodeB.lookup("global-pool") returns a GenServerRef proxying to nodeA
-    pool.stop()
-}
-```
+## Round 5 — TCP remote poolboy + distributed global
+
+**kotlin-otp-only distribution:** TCP links between JVMs via [`KotlinNodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/KotlinNodeTransport.kt) + kotlinx.serialization — not Erlang EPMD, ETF, or mixed clusters ([`LIMITATIONS.md`](../../LIMITATIONS.md)).
+
+1. **[`PoolWire`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt)** — `WirePoolRequest` / `WirePoolCast` / `WireCheckoutResult` / `WorkerToken`; [`RemotePoolHandle`](src/main/kotlin/org/otpstudy/poolboy/RemotePoolHandle.kt) always encodes on the wire.
+2. **[`PooledWorker<W>`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt)** — `checkout()` returns `PooledWorker?` instead of `GenServerRef`; [`LocalPooledWorker`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) vs [`RemotePooledWorker`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) (`ForwardCall` + token checkin).
+3. **[`DistributionWire.encodeSerializable`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistributionWire.kt)** — registered `@Serializable` types round-trip as `JsonElement` (not `toString()`).
+4. **[`GlobalRegistry.install`](../../otp-global/src/main/kotlin/org/otpstudy/global/GlobalRegistry.kt)** — broadcast [`GlobalDistMsg`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/GlobalDistMsg.kt) on [`DistMsg.Global`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistMsg.kt); `syncPeers` on connect; remote `whereis` → [`RemoteGenServerRef`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/RemoteGenServerRef.kt).
+
+**Remote borrower limitation:** TCP checkout cannot install a home-node monitor on the client's `Job` (no cross-JVM `Job`). Wire checkouts skip the borrower `invokeOnCompletion` hook; worker return relies on explicit `checkin`, `transaction` `finally`, and transport `call` timeout — not automatic return on client coroutine cancel. Follow-up: `WireBorrowerDown` cast from client on cancel.
+
+**OTP divergence (documented):** global registration uses async broadcast + `syncPeers`, not synchronous OTP `multi_call` on every `register_name`; netsplit locker protocol is out of scope.
 
 ## Conceptual gap deliberately preserved
 
-A *connection pool* is a JVM-local resource (open `java.sql.Connection`s, sockets, file handles…) — checking one out on node A and using it on node B is meaningless on the JVM, just as it is on BEAM. So even when the distribution variants above land, the practical use case for "distributed poolboy" stays narrow (mostly: control-plane processes addressed via the pool, not the pooled resources themselves).
+A *connection pool* is a JVM-local resource (open `java.sql.Connection`s, sockets, file handles…) — checking one out on node A and using it on node B is meaningless on the JVM, just as it is on BEAM. Cross-JVM use is **reach the pool on the home node** and forward worker RPCs through [`PooledWorker`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) — not shipping JDBC connections or `GenServerRef` mailboxes across the wire.

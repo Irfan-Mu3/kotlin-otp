@@ -29,4 +29,9 @@ sealed class DistMsg {
     @Serializable
     @SerialName("pong")
     data object Pong : DistMsg()
+
+    /** Global name replication ([GlobalDistMsg]) — not routed to a named actor. */
+    @Serializable
+    @SerialName("global")
+    data class Global(val payload: GlobalDistMsg) : DistMsg()
 }

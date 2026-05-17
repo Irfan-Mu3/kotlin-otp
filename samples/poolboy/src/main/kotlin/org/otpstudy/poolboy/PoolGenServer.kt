@@ -3,6 +3,9 @@ package org.otpstudy.poolboy
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
 import org.otpstudy.core.OtpLogging
@@ -14,6 +17,9 @@ import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.ReplyHandle
 import org.otpstudy.genserver.ReplyResult
 import org.otpstudy.genserver.TerminateReason
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import org.otpstudy.distribution.DistributionWire
 import org.otpstudy.supervisor.DynamicSupervisorRef
 
 /**
@@ -49,6 +55,7 @@ internal data class WaitingItem<W>(
     val borrower: Job,
     val borrowerHook: DisposableHandle,
     val from: ReplyHandle<PoolState<W>>,
+    val wireReply: Boolean,
 )
 
 /**
@@ -126,10 +133,21 @@ internal class PoolGenServer<W>(
     override suspend fun init(self: GenServerRef<PoolState<W>>): InitResult<PoolState<W>> {
         deliver.set(self::sendInfo)
         val state = PoolState<W>(config)
-        repeat(config.size) {
-            val spawned = workerHandler.spawn()
-            state.available.addLast(spawned)
-        }
+        // Parallelize prepopulation: each spawn round-trips through DynamicSupervisor's
+        // coordinator (which since the round-2 upstream fix offloads ready handshakes off
+        // the main loop), and may then block on the worker's own init when the user's
+        // factory uses GenServers.startLinkSync. coroutineScope gives us structured
+        // cancellation: if any spawn throws, siblings are cancelled and the exception
+        // propagates to Poolboy.startLink's catch which shuts down the dynamic supervisor.
+        val spawned: List<SpawnedWorker<W>> =
+            if (config.size == 0) {
+                emptyList()
+            } else {
+                coroutineScope {
+                    (0 until config.size).map { async { workerHandler.spawn() } }.awaitAll()
+                }
+            }
+        for (worker in spawned) state.available.addLast(worker)
         return InitResult.Ok(state)
     }
 
@@ -142,31 +160,44 @@ internal class PoolGenServer<W>(
         request: Any,
         state: PoolState<W>,
         from: ReplyHandle<PoolState<W>>,
-    ): ReplyResult<PoolState<W>> =
-        when (request) {
-            is PoolRequest.Checkout -> handleCheckout(request, state, from)
-            PoolRequest.Status -> ReplyResult.Reply(state.status(), state)
-            PoolRequest.Stop -> ReplyResult.Stop(Unit, TerminateReason.Normal, state)
-            else -> {
-                // Don't crash the pool over a stray message (matches OTP's general
-                // gen_server discipline of {reply, {error, invalid_message}, State}).
-                // Reply with null so the caller's `call` returns rather than timing out.
-                logUnknown("call", request)
-                ReplyResult.Reply(null, state)
-            }
+    ): ReplyResult<PoolState<W>> {
+        val wireRequest = isWireEnvelope(request)
+        val req = parsePoolRequest(request) ?: run {
+            logUnknown("call", request)
+            return ReplyResult.Reply(null, state)
         }
+        return when (req) {
+            is PoolRequest.Checkout -> handleCheckout(req, state, from, wireRequest)
+            is PoolRequest.ForwardCall -> handleForwardCall(req, state)
+            PoolRequest.Status ->
+                ReplyResult.Reply(
+                    if (wireRequest) {
+                        DistributionWire.encodeSerializable(PoolWire.toWire(state.status()))
+                    } else {
+                        state.status()
+                    },
+                    state,
+                )
+            PoolRequest.Stop -> ReplyResult.Stop(Unit, TerminateReason.Normal, state)
+        }
+    }
 
     override suspend fun handleCast(
         request: Any,
         state: PoolState<W>,
     ): NoreplyResult<PoolState<W>> {
-        when (request) {
+        val cast =
+            parsePoolCast(request) ?: run {
+                logUnknown("cast", request)
+                return NoreplyResult.Noreply(state)
+            }
+        when (cast) {
             is PoolCast.Checkin -> {
                 @Suppress("UNCHECKED_CAST")
-                handleReturnedWorker(request.worker as GenServerRef<W>, state)
+                handleReturnedWorker(cast.worker as GenServerRef<W>, state)
             }
-            is PoolCast.CancelWaiting -> handleCancelWaiting(request.cref, state)
-            else -> logUnknown("cast", request)
+            is PoolCast.CheckinToken -> handleCheckinByToken(cast.workerId, cast.checkoutCref, state)
+            is PoolCast.CancelWaiting -> handleCancelWaiting(cast.cref, state)
         }
         return NoreplyResult.Noreply(state)
     }
@@ -200,31 +231,103 @@ internal class PoolGenServer<W>(
         state.available.clear()
     }
 
+    private suspend fun handleForwardCall(
+        req: PoolRequest.ForwardCall,
+        state: PoolState<W>,
+    ): ReplyResult<PoolState<W>> {
+        val worker =
+            state.crefIndex[req.checkoutCref]
+                ?: findCheckedOutWorker(state, req.workerId)
+        if (worker == null) {
+            logUnknown("forward", req)
+            return ReplyResult.Reply(null, state)
+        }
+        @Suppress("UNCHECKED_CAST")
+        val reply = worker.call<Any?>(req.request)
+        val wireReply: JsonElement =
+            when (reply) {
+                is JsonElement -> reply
+                else -> DistributionWire.encodePayload(reply)
+            }
+        return ReplyResult.Reply(wireReply, state)
+    }
+
+    private fun findCheckedOutWorker(state: PoolState<W>, workerId: Long): GenServerRef<W>? =
+        state.monitors.keys.firstOrNull { it.id.value == workerId }
+
+    private suspend fun handleCheckinByToken(
+        workerId: Long,
+        checkoutCref: CheckoutRef,
+        state: PoolState<W>,
+    ) {
+        val worker = findCheckedOutWorker(state, workerId) ?: run {
+            logForeignCheckinByToken(workerId, checkoutCref)
+            return
+        }
+        val entry = state.monitors[worker] ?: return
+        if (entry.cref != checkoutCref) {
+            logForeignCheckinByToken(workerId, checkoutCref)
+            return
+        }
+        handleReturnedWorker(worker, state)
+    }
+
     private suspend fun handleCheckout(
         req: PoolRequest.Checkout,
         state: PoolState<W>,
         from: ReplyHandle<PoolState<W>>,
+        wireReply: Boolean,
     ): ReplyResult<PoolState<W>> {
         val borrowerJob = req.borrower ?: from.callerJob
-            ?: error("checkout requires a borrower Job (implicit from GenServerRef.call or explicit)")
+        if (borrowerJob == null && !wireReply) {
+            error("checkout requires a borrower Job (implicit from GenServerRef.call or explicit)")
+        }
         val taken = takeAvailable(state)
         if (taken != null) {
-            installMonitor(state, taken, req.cref, borrowerJob)
-            return ReplyResult.Reply(taken.ref, state)
+            installMonitor(state, taken, req.cref, borrowerJob, skipBorrowerHook = wireReply)
+            return checkoutReply(taken, req.cref, state, wireReply)
         }
         if (state.overflow < config.maxOverflow) {
             val spawned = workerHandler.spawn()
             state.overflow += 1
-            installMonitor(state, spawned, req.cref, borrowerJob)
-            return ReplyResult.Reply(spawned.ref, state)
+            installMonitor(state, spawned, req.cref, borrowerJob, skipBorrowerHook = wireReply)
+            return checkoutReply(spawned, req.cref, state, wireReply)
         }
         if (!req.block) {
-            return ReplyResult.Reply(null, state)
+            return if (wireReply) {
+                ReplyResult.Reply(
+                    DistributionWire.encodeSerializable<WireCheckoutResult>(WireCheckoutResult.Full),
+                    state,
+                )
+            } else {
+                ReplyResult.Reply(null, state)
+            }
         }
-        val hook = installBorrowerHook(req.cref, borrowerJob)
-        state.waiting.addLast(WaitingItem(req.cref, borrowerJob, hook, from))
+        val hook =
+            if (borrowerJob != null) {
+                installBorrowerHook(req.cref, borrowerJob)
+            } else {
+                noopBorrowerHook
+            }
+        state.waiting.addLast(
+            WaitingItem(req.cref, borrowerJob ?: noopBorrowerJob, hook, from, wireReply),
+        )
         return ReplyResult.DeferReply(from, state)
     }
+
+    private fun checkoutReply(
+        spawned: SpawnedWorker<W>,
+        cref: CheckoutRef,
+        state: PoolState<W>,
+        wireReply: Boolean,
+    ): ReplyResult<PoolState<W>> =
+        if (wireReply) {
+            val wireResult: WireCheckoutResult =
+                WireCheckoutResult.Worker(WorkerToken(spawned.ref.id.value, cref))
+            ReplyResult.Reply(DistributionWire.encodeSerializable(wireResult), state)
+        } else {
+            ReplyResult.Reply(spawned.ref, state)
+        }
 
     private suspend fun handleReturnedWorker(worker: GenServerRef<W>, state: PoolState<W>) {
         val entry = state.monitors.remove(worker)
@@ -280,7 +383,7 @@ internal class PoolGenServer<W>(
             state.monitors[replacement.ref] =
                 MonitorEntry(pending.cref, pending.borrower, pending.borrowerHook, replacement)
             state.crefIndex[pending.cref] = replacement.ref
-            pending.from.reply(replacement.ref)
+            replyCheckoutToWaiter(pending, replacement)
             return
         }
         if (state.overflow > 0) {
@@ -318,7 +421,7 @@ internal class PoolGenServer<W>(
             state.monitors[spawned.ref] =
                 MonitorEntry(pending.cref, pending.borrower, pending.borrowerHook, spawned)
             state.crefIndex[pending.cref] = spawned.ref
-            pending.from.reply(spawned.ref)
+            replyCheckoutToWaiter(pending, spawned)
             return
         }
         if (state.overflow > 0) {
@@ -340,11 +443,23 @@ internal class PoolGenServer<W>(
         state: PoolState<W>,
         spawned: SpawnedWorker<W>,
         cref: CheckoutRef,
-        borrower: Job,
+        borrower: Job?,
+        skipBorrowerHook: Boolean = false,
     ) {
-        val hook = installBorrowerHook(cref, borrower)
-        state.monitors[spawned.ref] = MonitorEntry(cref, borrower, hook, spawned)
+        val hook =
+            if (!skipBorrowerHook && borrower != null) {
+                installBorrowerHook(cref, borrower)
+            } else {
+                noopBorrowerHook
+            }
+        val job = borrower ?: noopBorrowerJob
+        state.monitors[spawned.ref] = MonitorEntry(cref, job, hook, spawned)
         state.crefIndex[cref] = spawned.ref
+    }
+
+    private companion object {
+        private val noopBorrowerJob = Job()
+        private val noopBorrowerHook: DisposableHandle = DisposableHandle { }
     }
 
     /**
@@ -365,6 +480,61 @@ internal class PoolGenServer<W>(
             message = "ignoring unknown $kind: ${request::class.qualifiedName ?: request::class.simpleName} ($request)",
         )
     }
+
+    private fun replyCheckoutToWaiter(
+        pending: WaitingItem<W>,
+        spawned: SpawnedWorker<W>,
+    ) {
+        if (pending.wireReply) {
+            val wireResult: WireCheckoutResult =
+                WireCheckoutResult.Worker(WorkerToken(spawned.ref.id.value, pending.cref))
+            pending.from.reply(DistributionWire.encodeSerializable(wireResult))
+        } else {
+            pending.from.reply(spawned.ref)
+        }
+    }
+
+    private fun logForeignCheckinByToken(workerId: Long, cref: CheckoutRef) {
+        OtpLogging.log(
+            level = OtpLogLevel.Warn,
+            ctx = OtpLogContext(component = "poolboy", tag = config.name),
+            message = "ignoring token checkin for unknown worker $workerId cref=$cref",
+        )
+    }
+
+    private fun isWireEnvelope(request: Any): Boolean =
+        request is WirePoolRequest || request is WirePoolCast ||
+            request is JsonElement || request is JsonObject
+
+    private fun parsePoolRequest(request: Any): PoolRequest? =
+        when (request) {
+            is PoolRequest -> request
+            is WirePoolRequest -> PoolWire.fromWire(request)
+            is JsonElement ->
+                runCatching {
+                    PoolWire.fromWire(DistributionWire.decodeSerializable<WirePoolRequest>(request))
+                }.getOrNull()
+            is JsonObject ->
+                runCatching {
+                    PoolWire.fromWire(DistributionWire.decodeSerializable<WirePoolRequest>(request))
+                }.getOrNull()
+            else -> null
+        }
+
+    private fun parsePoolCast(request: Any): PoolCast? =
+        when (request) {
+            is PoolCast -> request
+            is WirePoolCast -> PoolWire.fromWire(request)
+            is JsonElement ->
+                runCatching {
+                    PoolWire.fromWire(DistributionWire.decodeSerializable<WirePoolCast>(request))
+                }.getOrNull()
+            is JsonObject ->
+                runCatching {
+                    PoolWire.fromWire(DistributionWire.decodeSerializable<WirePoolCast>(request))
+                }.getOrNull()
+            else -> null
+        }
 
     private fun logForeignCheckin(worker: GenServerRef<W>) {
         OtpLogging.log(

@@ -19,4 +19,7 @@ interface NodeTransport {
 
     /** RPC call to [targetName] on [targetNode]. Returns the reply or throws on timeout/error. */
     suspend fun call(targetNode: NodeId, targetName: String, request: Any, timeout: Duration): Any?
+
+    /** Replicate [GlobalDistMsg] to connected peers (no-op unless overridden). */
+    suspend fun broadcastGlobal(msg: GlobalDistMsg) {}
 }

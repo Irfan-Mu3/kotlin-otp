@@ -16,7 +16,14 @@ import org.otpstudy.core.Shutdown
 import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InfoMsg
+import org.otpstudy.genserver.ServerDownException
+import org.otpstudy.distribution.LocalNode
+import org.otpstudy.distribution.NodeTransport
 import org.otpstudy.registry.GlobalProcessRegistry
+import org.otpstudy.distribution.RemoteGenServerRef
+import org.otpstudy.global.GlobalRegistry
+import org.otpstudy.registry.GlobalProcessRegistryResolver
+import org.otpstudy.registry.ProcessResolver
 import org.otpstudy.supervisor.DynamicSupervisor
 import org.otpstudy.supervisor.DynamicSupervisorRef
 import org.otpstudy.supervisor.SimpleOneForOneTemplate
@@ -59,45 +66,70 @@ fun interface WorkerFactory<W> {
  */
 class PoolRef<W> internal constructor(
     internal val ref: GenServerRef<PoolState<W>>,
-    private val dynSup: DynamicSupervisorRef,
+    private val dynSup: DynamicSupervisorRef?,
     private val name: String?,
-) {
+    private val homeNode: LocalNode? = null,
+) : PoolHandle<W> {
+    override val poolName: String? get() = name
     private val stopped = AtomicBoolean(false)
 
     /**
      * Borrow a worker. `block = false` returns `null` instead of waiting if the pool
      * is at capacity (poolboy's `full` atom). [borrower] overrides the caller [Job]
      * inferred from [GenServerRef.call]; pass only for non-standard call paths.
+     *
+     * @throws PoolStoppedException if the pool's gen_server has stopped (e.g. via
+     *   [stop] or because the parent supervisor tore it down). Maps the underlying
+     *   [ServerDownException] so callers don't have to depend on kotlin-otp internals.
      */
-    suspend fun checkout(
-        block: Boolean = true,
-        timeout: Duration = 5.seconds,
-        borrower: Job? = null,
-    ): GenServerRef<W>? {
+    override suspend fun checkout(
+        block: Boolean,
+        timeout: Duration,
+        borrower: Job?,
+    ): PooledWorker<W>? {
         val cref = nextCheckoutRef()
         val req = PoolRequest.Checkout(cref, block, borrower)
         return try {
             @Suppress("UNCHECKED_CAST")
-            ref.call<Any?>(req, timeout) as GenServerRef<W>?
+            val workerRef = ref.call<Any?>(req, timeout) as GenServerRef<W>?
+            workerRef?.let { LocalPooledWorker(it, ::checkinWorker) }
+        } catch (t: ServerDownException) {
+            throw PoolStoppedException(name, t)
         } catch (t: Throwable) {
             ref.cast(PoolCast.CancelWaiting(cref))
             throw t
         }
     }
 
-    /** Return a worker to the pool (poolboy `checkin/2`). Always asynchronous. */
-    fun checkin(worker: GenServerRef<W>) {
+    override fun checkin(worker: PooledWorker<W>) {
+        when (worker) {
+            is LocalPooledWorker -> checkinWorker(worker.ref)
+            else -> worker.checkin()
+        }
+    }
+
+    private fun checkinWorker(worker: GenServerRef<W>) {
         ref.cast(PoolCast.Checkin(worker))
     }
 
-    suspend fun status(): PoolStatus = ref.call(PoolRequest.Status)
+    /**
+     * Snapshot of pool capacity / load (poolboy `status/1`).
+     *
+     * @throws PoolStoppedException if the pool's gen_server has stopped.
+     */
+    override suspend fun status(): PoolStatus =
+        try {
+            ref.call(PoolRequest.Status)
+        } catch (t: ServerDownException) {
+            throw PoolStoppedException(name, t)
+        }
 
     /**
      * Cleanly stop the pool: synchronously stops the gen_server, then shuts down the
      * worker supervisor (which cancels every worker). Idempotent — second and later
      * calls return immediately.
      */
-    suspend fun stop() {
+    override suspend fun stop() {
         if (!stopped.compareAndSet(false, true)) return
         // NonCancellable: shutdown must complete even if the caller's coroutine is being
         // cancelled (e.g. test scope teardown), otherwise the dyn supervisor leaks.
@@ -107,43 +139,17 @@ class PoolRef<W> internal constructor(
             } catch (_: Throwable) {
             }
             ref.job.join()
-            dynSup.shutdown()
-            if (name != null) GlobalProcessRegistry.unregister(name, ref)
+            dynSup?.shutdown()
+            if (name != null) {
+                GlobalProcessRegistry.unregister(name, ref)
+                homeNode?.unregister(name)
+            }
         }
     }
 
     companion object {
         private val crefSeq = AtomicLong(0L)
         private fun nextCheckoutRef(): CheckoutRef = crefSeq.incrementAndGet()
-    }
-}
-
-/**
- * Borrow-then-return-then-rethrow helper. Mirror of poolboy's
- * [`transaction/2,3`](https://github.com/devinus/poolboy/blob/master/src/poolboy.erl#L79-L91).
- *
- * The worker is always checked back in, even if [block] throws. If both [block] and
- * the checkin throw, the checkin failure is added to the primary exception's
- * `suppressed` list (so the original cause is preserved).
- */
-suspend fun <W, T> PoolRef<W>.transaction(
-    timeout: Duration = 5.seconds,
-    block: suspend (GenServerRef<W>) -> T,
-): T {
-    val worker = checkout(block = true, timeout = timeout)
-        ?: error("pool returned null worker for blocking checkout")
-    var primary: Throwable? = null
-    try {
-        return block(worker)
-    } catch (t: Throwable) {
-        primary = t
-        throw t
-    } finally {
-        try {
-            checkin(worker)
-        } catch (t: Throwable) {
-            if (primary == null) throw t else primary.addSuppressed(t)
-        }
     }
 }
 
@@ -164,11 +170,95 @@ suspend fun <W, T> PoolRef<W>.transaction(
  *   [parent]; both tear everything down in the right order.
  */
 object Poolboy {
+    /**
+     * Resolve a [PoolAddress] to a [PoolHandle]. [PoolAddress.OnNode] requires [transport].
+     *
+     * Local / global / via addresses wrap the registered pool gen_server; [stop] on such a
+     * handle stops only the pool actor (not the dynamic supervisor — use the [PoolRef]
+     * returned from [startLink] for full teardown).
+     */
+    fun <W> resolve(
+        address: PoolAddress,
+        transport: NodeTransport? = null,
+    ): PoolHandle<W> =
+        when (address) {
+            is PoolAddress.Local ->
+                localHandle(GlobalProcessRegistryResolver, address.name)
+            is PoolAddress.Global ->
+                globalHandle(address.name, transport)
+            is PoolAddress.Via ->
+                localHandle(address.registry, address.name)
+            is PoolAddress.OnNode -> {
+                val t =
+                    transport
+                        ?: error("NodeTransport required for PoolAddress.OnNode")
+                RemotePoolHandle(t, address.node, address.name)
+            }
+        }
+
+  @Suppress("UNCHECKED_CAST")
+  private fun <W> localHandle(
+    resolver: ProcessResolver,
+    name: String,
+  ): PoolHandle<W> {
+    val ref =
+      resolver.lookup(name) as? GenServerRef<PoolState<W>>
+        ?: error("no pool registered as '$name'")
+    return PoolRef(ref, dynSup = null, name = name, homeNode = null)
+  }
+
+  private fun <W> globalHandle(
+    name: String,
+    transport: NodeTransport?,
+  ): PoolHandle<W> =
+    when (val resolved = GlobalRegistry.resolveName(name)) {
+      is GlobalRegistry.NameResolution.LocalRef<*> -> {
+        @Suppress("UNCHECKED_CAST")
+        PoolRef(resolved.ref as GenServerRef<PoolState<W>>, dynSup = null, name = name, homeNode = null)
+      }
+      is GlobalRegistry.NameResolution.RemoteRef -> {
+        val t =
+          transport
+            ?: error("NodeTransport required for remote global pool '$name'")
+        RemotePoolHandle(t, resolved.stub.homeNode, resolved.stub.localName)
+      }
+      null -> error("no pool registered globally as '$name'")
+    }
+
+    suspend fun <W> checkout(
+        address: PoolAddress,
+        block: Boolean = true,
+        timeout: Duration = 5.seconds,
+        borrower: Job? = null,
+        transport: NodeTransport? = null,
+    ): PooledWorker<W>? = resolve<W>(address, transport).checkout(block, timeout, borrower)
+
+    fun <W> checkin(
+        address: PoolAddress,
+        worker: PooledWorker<W>,
+        transport: NodeTransport? = null,
+    ) {
+        resolve<W>(address, transport).checkin(worker)
+    }
+
+    suspend fun <W> status(
+        address: PoolAddress,
+        transport: NodeTransport? = null,
+    ): PoolStatus = resolve<W>(address, transport).status()
+
+    suspend fun <W, T> transaction(
+        address: PoolAddress,
+        timeout: Duration = 5.seconds,
+        transport: NodeTransport? = null,
+        block: suspend (PooledWorker<W>) -> T,
+    ): T = resolve<W>(address, transport).transaction(timeout, block)
+
     suspend fun <W> startLink(
         parent: CoroutineScope,
         config: PoolConfig,
         factory: WorkerFactory<W>,
         context: CoroutineContext = Dispatchers.Default,
+        homeNode: LocalNode? = null,
     ): PoolRef<W> {
         val deliver = AtomicReference<((InfoMsg) -> Unit)?>(null)
 
@@ -229,6 +319,7 @@ object Poolboy {
         if (config.name != null) {
             try {
                 GlobalProcessRegistry.register(config.name, ref)
+                homeNode?.register(config.name, ref)
             } catch (t: Throwable) {
                 // Registry collision (duplicate name) or similar: tear everything down so
                 // the caller doesn't get a half-alive PoolRef they can't stop cleanly.
@@ -240,6 +331,6 @@ object Poolboy {
             }
         }
 
-        return PoolRef(ref, dynSup, config.name)
+        return PoolRef(ref, dynSup, config.name, homeNode)
     }
 }

@@ -17,6 +17,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
 import org.otpstudy.core.OtpLogging
@@ -37,7 +38,8 @@ import kotlin.time.Duration.Companion.seconds
  *
  * **Misuse:** calling [ready] zero times hangs [startChildSync] until timeout; calling it
  * more than once fails that sync start; throwing before [ready] fails [startChildSync]
- * with that exception.
+ * with that exception (the dynamic child job does not rethrow the same failure once the
+ * sync handshake has completed the ready deferred exceptionally).
  *
  * Analogous to OTP `simple_one_for_one` but extended to support all three strategies
  * ([SupervisorStrategy.OneForOne], [SupervisorStrategy.OneForAll], [SupervisorStrategy.RestForOne]).
@@ -82,6 +84,14 @@ class DynamicSupervisorRef internal constructor(
      * Starts a child and waits until [SimpleOneForOneTemplate.start] invokes [ready] once
      * with the resource value, then returns [Pair] of [childId] and that value while the
      * child job keeps running.
+     *
+     * The ready handshake is awaited on a **separate** coroutine so the supervisor coordinator
+     * keeps processing other events ([startChild], [whichChildren], [ChildExited], …) while
+     * a sync start is in flight.
+     *
+     * If [shutdown] runs while this call is still waiting, the deferred completes exceptionally
+     * with [IllegalStateException] (`"shutting down"`), matching the reject-on-entry behaviour
+     * for calls made after shutdown has begun.
      *
      * @param timeout bounds how long the coordinator waits for the first [ready] call.
      * @throws kotlinx.coroutines.TimeoutCancellationException if [ready] is never invoked in time.
@@ -160,6 +170,17 @@ internal sealed class DynamicSupervisorEvent {
     data class RequestShutdown(
         val done: CompletableDeferred<Unit>,
     ) : DynamicSupervisorEvent()
+
+    /**
+     * Internal: sync-waiter coroutine finished (success, timeout, or await failure).
+     * [startEpoch] matches the slot incarnation from [startDynamicWorker] for failure cleanup.
+     */
+    data class StartChildSyncAwaitResult(
+        val reply: CompletableDeferred<Pair<String, Any?>>,
+        val childId: String,
+        val startEpoch: Long,
+        val result: Result<Any?>,
+    ) : DynamicSupervisorEvent()
 }
 
 private sealed class ReadyMode {
@@ -177,6 +198,18 @@ private class DynamicChildSlot(
     val restartTimestampsNanos: MutableList<Long> = mutableListOf()
     var job: Job? = null
     var startEpoch: Long = 0L
+
+    /** Set for [DynamicSupervisorEvent.StartChildSync] until the handshake completes (success or failure). */
+    var syncHandshakeActive: Boolean = false
+
+    /** [StartChildSync] caller reply while the sync waiter is in flight (cleared when handshake completes). */
+    var pendingSyncReply: CompletableDeferred<Pair<String, Any?>>? = null
+
+    /**
+     * When a sync handshake fails, matches [startEpoch] so [ChildExited] can skip [Restart.Permanent] restart
+     * when racing the waiter's failure delivery.
+     */
+    var lastSyncStartFailedEpoch: Long? = null
 }
 
 object DynamicSupervisor {
@@ -203,10 +236,17 @@ object DynamicSupervisor {
 
         val coordinator =
             supervisorScope.launch(CoroutineName("dynamic-supervisor-coordinator")) {
+                val pendingSyncReplies = mutableSetOf<CompletableDeferred<Pair<String, Any?>>>()
                 for (event in events) {
                     when (event) {
                         is DynamicSupervisorEvent.RequestShutdown -> {
                             shuttingDown.set(true)
+                            for (reply in pendingSyncReplies.toList()) {
+                                if (!reply.isCompleted) {
+                                    reply.completeExceptionally(IllegalStateException("shutting down"))
+                                }
+                            }
+                            pendingSyncReplies.clear()
                             for (slot in children.values.toList().asReversed()) {
                                 val j = slot.job ?: continue
                                 bumpEpoch(slot)
@@ -258,6 +298,9 @@ object DynamicSupervisor {
                             val slot = DynamicChildSlot(id, template)
                             children[id] = slot
                             val readyDeferred = CompletableDeferred<Any?>()
+                            slot.syncHandshakeActive = true
+                            slot.pendingSyncReply = event.reply
+                            pendingSyncReplies += event.reply
                             startDynamicWorker(
                                 slot,
                                 supervisorScope,
@@ -266,20 +309,88 @@ object DynamicSupervisor {
                                 readyMode = ReadyMode.Sync(readyDeferred),
                             )
                             val job = slot.job!!
-                            try {
-                                val value =
-                                    withTimeout(event.timeout) {
-                                        readyDeferred.await()
+                            val epoch = slot.startEpoch
+                            supervisorScope.launch(CoroutineName("dynamic-supervisor-sync-wait:$id")) {
+                                try {
+                                    val value =
+                                        withTimeout(event.timeout) {
+                                            readyDeferred.await()
+                                        }
+                                    if (!event.reply.isCompleted) {
+                                        events.trySend(
+                                            DynamicSupervisorEvent.StartChildSyncAwaitResult(
+                                                event.reply,
+                                                id,
+                                                epoch,
+                                                Result.success(value),
+                                            ),
+                                        )
                                     }
-                                event.reply.complete(Pair(id, value))
-                            } catch (t: TimeoutCancellationException) {
-                                job.cancel(t)
-                                event.reply.completeExceptionally(t)
-                            } catch (t: Throwable) {
-                                if (t is CancellationException) throw t
-                                job.cancel(CancellationException("startChildSync failed", t))
-                                event.reply.completeExceptionally(t)
+                                } catch (e: TimeoutCancellationException) {
+                                    job.cancel(e)
+                                    if (!event.reply.isCompleted) {
+                                        events.trySend(
+                                            DynamicSupervisorEvent.StartChildSyncAwaitResult(
+                                                event.reply,
+                                                id,
+                                                epoch,
+                                                Result.failure(e),
+                                            ),
+                                        )
+                                    }
+                                } catch (t: Throwable) {
+                                    if (t is CancellationException) {
+                                        if (!event.reply.isCompleted) {
+                                            events.trySend(
+                                                DynamicSupervisorEvent.StartChildSyncAwaitResult(
+                                                    event.reply,
+                                                    id,
+                                                    epoch,
+                                                    Result.failure(t),
+                                                ),
+                                            )
+                                        }
+                                        throw t
+                                    }
+                                    job.cancel(CancellationException("startChildSync failed", t))
+                                    if (!event.reply.isCompleted) {
+                                        events.trySend(
+                                            DynamicSupervisorEvent.StartChildSyncAwaitResult(
+                                                event.reply,
+                                                id,
+                                                epoch,
+                                                Result.failure(t),
+                                            ),
+                                        )
+                                    }
+                                }
                             }
+                        }
+                        is DynamicSupervisorEvent.StartChildSyncAwaitResult -> {
+                            pendingSyncReplies -= event.reply
+                            val slot = children[event.childId]
+                            event.result.fold(
+                                onSuccess = { value ->
+                                    if (slot != null && slot.startEpoch == event.startEpoch) {
+                                        slot.pendingSyncReply = null
+                                        slot.syncHandshakeActive = false
+                                    }
+                                    if (!event.reply.isCompleted) {
+                                        event.reply.complete(Pair(event.childId, value))
+                                    }
+                                },
+                                onFailure = { ex ->
+                                    if (slot != null && slot.startEpoch == event.startEpoch) {
+                                        slot.lastSyncStartFailedEpoch = event.startEpoch
+                                        children.remove(event.childId)
+                                        slot.pendingSyncReply = null
+                                        slot.syncHandshakeActive = false
+                                    }
+                                    if (!event.reply.isCompleted) {
+                                        event.reply.completeExceptionally(ex)
+                                    }
+                                },
+                            )
                         }
                         is DynamicSupervisorEvent.TerminateChild -> {
                             val slot = children.remove(event.id)
@@ -298,6 +409,29 @@ object DynamicSupervisor {
                             if (shuttingDown.get()) continue
                             val slot = children[event.id] ?: continue
                             if (event.startEpoch != slot.startEpoch) continue
+
+                            if (event.kind == ExitKind.Normal && slot.syncHandshakeActive) {
+                                var bail = false
+                                repeat(64) {
+                                    yield()
+                                    when (val s = children[event.id]) {
+                                        null -> {
+                                            bail = true
+                                            return@repeat
+                                        }
+                                        else -> {
+                                            if (s.startEpoch != event.startEpoch) return@repeat
+                                            if (s.lastSyncStartFailedEpoch == event.startEpoch) {
+                                                children.remove(event.id)
+                                                bail = true
+                                                return@repeat
+                                            }
+                                        }
+                                    }
+                                }
+                                if (bail) continue
+                                slot.syncHandshakeActive = false
+                            }
 
                             val abnormal =
                                 when (event.kind) {
@@ -425,7 +559,20 @@ object DynamicSupervisor {
                 } catch (t: Throwable) {
                     if (t is CancellationException) throw t
                     if (readyMode is ReadyMode.Sync && !readyMode.deferred.isCompleted) {
-                        readyMode.deferred.completeExceptionally(t)
+                        if (readyMode.deferred.completeExceptionally(t)) {
+                            val pr = slot.pendingSyncReply
+                            if (pr != null) {
+                                events.trySend(
+                                    DynamicSupervisorEvent.StartChildSyncAwaitResult(
+                                        pr,
+                                        id,
+                                        slot.startEpoch,
+                                        Result.failure(t),
+                                    ),
+                                )
+                            }
+                            return@launch
+                        }
                     }
                     throw t
                 }

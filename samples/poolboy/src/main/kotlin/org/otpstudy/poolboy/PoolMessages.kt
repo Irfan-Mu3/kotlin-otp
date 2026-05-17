@@ -43,6 +43,25 @@ data class PoolStatus(
 )
 
 /**
+ * Thrown by [PoolRef.checkout], [PoolRef.status], and [PoolRef.transaction] when the
+ * pool's gen_server has stopped — either via [PoolRef.stop], because the actor crashed
+ * and was not restarted, or because the surrounding application is shutting down.
+ *
+ * Wraps the underlying [org.otpstudy.genserver.ServerDownException] (preserved as
+ * `cause`) so callers can distinguish "pool is gone" from transient call failures
+ * (timeouts, mailbox-full) without depending on kotlin-otp's internal exception types.
+ *
+ * In poolboy / OTP this is `noproc` from `gen_server:call`.
+ */
+class PoolStoppedException(
+    val poolName: String?,
+    cause: Throwable? = null,
+) : IllegalStateException(
+    "poolboy pool ${poolName?.let { "'$it'" } ?: "(anonymous)"} is stopped",
+    cause,
+)
+
+/**
  * Caller-supplied identity used to monitor the borrower. Equivalent to BEAM's `From`
  * pid in `gen_server:call`. On the JVM we don't get the caller's [Job] for free,
  * so [PoolRef.checkout] takes it explicitly (defaulted to the current coroutine's job).
@@ -67,11 +86,21 @@ internal sealed class PoolRequest {
 
     /** `stop` call. */
     data object Stop : PoolRequest()
+
+    /** Proxy a worker call on the pool home node (cross-JVM [PooledWorker]). */
+    data class ForwardCall(
+        val checkoutCref: CheckoutRef,
+        val workerId: Long,
+        val request: Any,
+    ) : PoolRequest()
 }
 
 internal sealed class PoolCast {
-    /** `{checkin, Pid}` in poolboy. */
+    /** `{checkin, Pid}` in poolboy — same JVM only. */
     data class Checkin(val worker: GenServerRef<*>) : PoolCast()
+
+    /** Token checkin for [WirePoolCast.CheckinToken] / TCP. */
+    data class CheckinToken(val workerId: Long, val checkoutCref: CheckoutRef) : PoolCast()
 
     /** `{cancel_waiting, CRef}` in poolboy. */
     data class CancelWaiting(val cref: CheckoutRef) : PoolCast()

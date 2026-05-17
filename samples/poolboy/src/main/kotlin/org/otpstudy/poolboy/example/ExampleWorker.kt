@@ -129,8 +129,28 @@ class ExampleWorker(private val args: WorkerArgs) : GenServer<WorkerState> {
     }
 
     companion object {
-        /** Convenience: factory that starts a worker bound to [args] under the given scope. */
+        /**
+         * Factory that starts a worker bound to [args] under the given scope.
+         *
+         * Uses [GenServers.startLinkSync] (not the non-suspending [GenServers.startLink])
+         * so:
+         *
+         * - Connection failures (bad JDBC URL, unreachable DB, missing driver) surface at
+         *   *spawn* time — i.e. inside [Poolboy.startLink] / `init` — instead of at the
+         *   first [PoolRef.checkout] + [GenServerRef.call] cycle. The pool either starts
+         *   up healthy or fails fast, mirroring how a `gen_server:start_link` for an
+         *   `epgsql` worker behaves on BEAM.
+         * - The supervisor's `startChildSync` round-trip blocks on this worker's [init],
+         *   so [PoolGenServer.init]'s parallel pre-population (round 3) actually
+         *   parallelises the JDBC handshake — `size = 50` warms up in roughly the time
+         *   of a single connection rather than `50 ×` it.
+         *
+         * Cost: a worker whose [init] hangs forever will hang the pool's [init] until the
+         * supervisor's `startChildSync` timeout fires (60 s default). For real DB workers
+         * this is the right behaviour; for "fire and forget" workers prefer the
+         * non-suspending [GenServers.startLink] variant.
+         */
         fun factory(args: WorkerArgs): WorkerFactory<WorkerState> =
-            WorkerFactory { scope -> GenServers.startLink(scope, ExampleWorker(args)) }
+            WorkerFactory { scope -> GenServers.startLinkSync(scope, ExampleWorker(args)) }
     }
 }

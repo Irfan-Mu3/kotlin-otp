@@ -75,6 +75,7 @@ class KotlinNodeTransport(
         check(confirmed == remoteNode) { "handshake: expected $remoteNode but got $confirmed" }
         connections[remoteNode] = conn
         NodeMonitor.notifyUp(remoteNode)
+        GlobalReplicationBus.onPeerConnected?.invoke(remoteNode)
         startReceiving(checkNotNull(appScope), remoteNode, conn)
     }
 
@@ -86,6 +87,7 @@ class KotlinNodeTransport(
         val remoteId = conn.handshake(localNodeWire(), clusterSecret, initiator = false)
         connections[remoteId] = conn
         NodeMonitor.notifyUp(remoteId)
+        GlobalReplicationBus.onPeerConnected?.invoke(remoteId)
         startReceiving(scope, remoteId, conn)
     }
 
@@ -120,19 +122,25 @@ class KotlinNodeTransport(
             is DistMsg.Ping -> conn.send(DistMsg.Pong)
             is DistMsg.Hello -> { /* post-handshake only */ }
             is DistMsg.Pong -> Unit
+            is DistMsg.Global -> GlobalReplicationBus.handler?.onMessage(msg.payload, remote)
         }
     }
 
-    private fun scopeLaunchCall(conn: KotlinDistConnection, msg: DistMsg.Call, ref: GenServerRef<*>) {
-        val scope = checkNotNull(appScope)
-        scope.launch(Dispatchers.Default) {
-            try {
-                val req = DistributionWire.decodeGenServerPayload(msg.req)
-                val result = ref.call<Any?>(req, 60.seconds)
-                conn.send(DistMsg.Reply(msg.id, DistributionWire.encodePayload(result)))
-            } catch (t: Throwable) {
-                conn.send(DistMsg.Reply(msg.id, DistributionWire.encodePayload("error:${t.message}")))
-            }
+    /** Broadcast a [GlobalDistMsg] to every connected peer. */
+    override suspend fun broadcastGlobal(msg: GlobalDistMsg) {
+        val frame = DistMsg.Global(msg)
+        for (conn in connections.values) {
+            conn.send(frame)
+        }
+    }
+
+    private suspend fun scopeLaunchCall(conn: KotlinDistConnection, msg: DistMsg.Call, ref: GenServerRef<*>) {
+        try {
+            val req = DistributionWire.decodeGenServerPayload(msg.req)
+            val result = ref.call<Any?>(req, 60.seconds)
+            conn.send(DistMsg.Reply(msg.id, DistributionWire.encodePayload(result)))
+        } catch (t: Throwable) {
+            conn.send(DistMsg.Reply(msg.id, DistributionWire.encodePayload("error:${t.message}")))
         }
     }
 
