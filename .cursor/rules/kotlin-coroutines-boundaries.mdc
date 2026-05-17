@@ -45,3 +45,8 @@ globs: **/*.kt
 
 - **`GenServerRef.cast`** and **`call`** take **`Any`**, not **`Any?`**.
 - Decoded JSON may be **`null`** (`JsonNull`). Map at **one** place: use **`DistributionWire.decodeGenServerPayload`** (or **`asGenServerPayload`**) so every transport path stays consistent (default: **`null` → `Unit`**).
+
+## Borrower `Job` hooks (poolboy / leases)
+
+- **Never** call `Job.invokeOnCompletion` on a **shared sentinel `Job()`** to mean “no monitor.” Cross-JVM wire checkout uses **`BorrowerLease.Remote`** — no home-node completion handler.
+- Same-JVM checkout uses **`BorrowerLease.Local(callerJob)`** only; the job must be **`ReplyHandle.callerJob`** (captured before `withTimeout` in `GenServerRef.call`) or an explicit request override.

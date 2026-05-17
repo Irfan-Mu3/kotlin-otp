@@ -22,6 +22,15 @@ interface PooledWorker<W> {
     fun checkin()
 }
 
+/** Runs [block] and always [checkin]s in `finally` (local or remote). */
+suspend inline fun <W, R> PooledWorker<W>.useLease(block: suspend PooledWorker<W>.() -> R): R {
+    try {
+        return block()
+    } finally {
+        checkin()
+    }
+}
+
 class LocalPooledWorker<W>(
     val ref: GenServerRef<W>,
     private val onCheckin: (GenServerRef<W>) -> Unit,

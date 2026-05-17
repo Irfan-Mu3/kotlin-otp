@@ -30,12 +30,13 @@ import org.otpstudy.application.ApplicationStartResult
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.Timeout
 import org.otpstudy.distribution.InMemoryTransport
-import org.otpstudy.distribution.KotlinNodeTransport
 import org.otpstudy.distribution.LocalNode
 import org.otpstudy.distribution.NodeId
 import org.otpstudy.registry.ProcessRegistry
 import kotlinx.coroutines.cancelChildren
+import org.junit.jupiter.api.AfterEach
 import org.otpstudy.global.GlobalRegistry
+import org.otpstudy.poolboy.test.TcpLoopbackPair
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.registry.MapViaRegistry
 import org.otpstudy.genserver.GenServers
@@ -121,10 +122,15 @@ private suspend fun <W> PoolRef<W>.awaitStatus(
 
 @Timeout(value = 60, unit = TimeUnit.SECONDS)
 class PoolboyTest {
+    @AfterEach
+    fun resetGlobalRegistry() {
+        GlobalRegistry.reset()
+    }
+
     @Test
     fun pool_wire_roundtrip(): Unit =
         runBlocking {
-            val req: WirePoolRequest = WirePoolRequest.Checkout(cref = 1L, block = true, borrowerPresent = false)
+            val req: WirePoolRequest = WirePoolRequest.Checkout(cref = 1L, block = true)
             val el = org.otpstudy.distribution.DistributionWire.encodeSerializable(req)
             val back = org.otpstudy.distribution.DistributionWire.decodeSerializable<WirePoolRequest>(el)
             assertEquals(req, back)
@@ -730,171 +736,171 @@ class PoolboyTest {
         }
 
     @Test
-    fun pool_checkout_via_tcp_loopback(): Unit =
+    fun wire_checkout_retains_lease_until_checkin(): Unit =
         runBlocking {
-            val suffix = System.nanoTime().toString()
-            val poolName = "tcp-checkout-$suffix"
-            val nodeIdA = NodeId("a-$suffix", "loopback")
-            val nodeIdB = NodeId("b-$suffix", "loopback")
-            val regA = ProcessRegistry()
-            val regB = ProcessRegistry()
-            val ta = KotlinNodeTransport(nodeIdA, "", 0)
-            val tb = KotlinNodeTransport(nodeIdB, "", 0)
+            val nodeIdA = NodeId("lease-a-${System.nanoTime()}", "mem")
+            val nodeIdB = NodeId("lease-b-${System.nanoTime()}", "mem")
+            val nodeA = LocalNode(nodeIdA)
+            val nodeB = LocalNode(nodeIdB)
+            val transport =
+                InMemoryTransport().also {
+                    it.addNode(nodeA)
+                    it.addNode(nodeB)
+                    it.connect(nodeA, nodeB)
+                }
+            val pool =
+                Poolboy.startLink(
+                    this,
+                    PoolConfig(size = 1, maxOverflow = 0, name = "lease-pool"),
+                    testFactory(),
+                    homeNode = nodeB,
+                )
             try {
-                tb.startAccepting(this, regB)
-                ta.startAccepting(this, regA)
-                val home = LocalNode(nodeIdB)
-                val pool =
-                    Poolboy.startLink(
-                        this,
-                        PoolConfig(size = 1, maxOverflow = 0, name = poolName),
-                        testFactory(),
-                        homeNode = home,
-                    )
-                regB.register(poolName, pool.ref)
-                ta.connectOut(this, regA, nodeIdB, "127.0.0.1", tb.boundPort)
                 val remote =
                     Poolboy.resolve<CounterState>(
-                        PoolAddress.OnNode(poolName, nodeIdB),
-                        ta,
+                        PoolAddress.OnNode("lease-pool", nodeIdB),
+                        transport,
                     )
                 val worker = remote.checkout()!!
-                val calls = worker.call<Int>(Unit)
-                assertEquals(1, calls)
+                assertEquals(1, pool.status().monitors, "remote checkout must install a monitor on the home pool")
+                assertEquals(1, worker.call<Int>(Unit))
                 worker.checkin()
+                assertEquals(0, pool.status().monitors)
             } finally {
-                ta.close()
-                tb.close()
-                coroutineContext.job.cancelChildren()
+                pool.stop()
+            }
+        }
+
+    @Test
+    fun pool_checkout_via_tcp_loopback(): Unit =
+        runBlocking {
+            val poolName = "tcp-checkout-${System.nanoTime()}"
+            TcpLoopbackPair().use { tcp ->
+                try {
+                    tcp.start(this)
+                    val pool =
+                        Poolboy.startLink(
+                            this,
+                            PoolConfig(size = 1, maxOverflow = 0, name = poolName),
+                            testFactory(),
+                            homeNode = tcp.localB,
+                        )
+                    tcp.regB.register(poolName, pool.ref)
+                    tcp.connect(this)
+                    val remote =
+                        Poolboy.resolve<CounterState>(
+                            PoolAddress.OnNode(poolName, tcp.nodeIdB),
+                            tcp.transportA,
+                        )
+                    val worker = remote.checkout()!!
+                    assertEquals(1, worker.call<Int>(Unit))
+                    worker.checkin()
+                } finally {
+                    tcp.cancelChildren(this)
+                }
             }
         }
 
     @Test
     fun pool_status_via_tcp_loopback(): Unit =
         runBlocking {
-            val suffix = System.nanoTime().toString()
-            val poolName = "tcp-status-$suffix"
-            val nodeIdA = NodeId("a-$suffix", "loopback")
-            val nodeIdB = NodeId("b-$suffix", "loopback")
-            val regA = ProcessRegistry()
-            val regB = ProcessRegistry()
-            val ta = KotlinNodeTransport(nodeIdA, "", 0)
-            val tb = KotlinNodeTransport(nodeIdB, "", 0)
-            try {
-                tb.startAccepting(this, regB)
-                ta.startAccepting(this, regA)
-                val pool =
-                    Poolboy.startLink(
-                        this,
-                        PoolConfig(size = 2, maxOverflow = 0, name = poolName),
-                        testFactory(),
-                        homeNode = LocalNode(nodeIdB),
-                    )
-                regB.register(poolName, pool.ref)
-                ta.connectOut(this, regA, nodeIdB, "127.0.0.1", tb.boundPort)
-                val remote =
-                    Poolboy.resolve<CounterState>(
-                        PoolAddress.OnNode(poolName, nodeIdB),
-                        ta,
-                    )
-                assertEquals(PoolStatus(PoolStateName.Ready, 2, 0, 0), remote.status())
-            } finally {
-                ta.close()
-                tb.close()
-                coroutineContext.job.cancelChildren()
+            val poolName = "tcp-status-${System.nanoTime()}"
+            TcpLoopbackPair().use { tcp ->
+                try {
+                    tcp.start(this)
+                    val pool =
+                        Poolboy.startLink(
+                            this,
+                            PoolConfig(size = 2, maxOverflow = 0, name = poolName),
+                            testFactory(),
+                            homeNode = tcp.localB,
+                        )
+                    tcp.regB.register(poolName, pool.ref)
+                    tcp.connect(this)
+                    val remote =
+                        Poolboy.resolve<CounterState>(
+                            PoolAddress.OnNode(poolName, tcp.nodeIdB),
+                            tcp.transportA,
+                        )
+                    assertEquals(PoolStatus(PoolStateName.Ready, 2, 0, 0), remote.status())
+                } finally {
+                    tcp.cancelChildren(this)
+                }
             }
         }
 
     @Test
     fun tcp_checkin_returns_worker_to_pool(): Unit =
         runBlocking {
-            val suffix = System.nanoTime().toString()
-            val poolName = "tcp-checkin-$suffix"
-            val nodeIdA = NodeId("a-$suffix", "loopback")
-            val nodeIdB = NodeId("b-$suffix", "loopback")
-            val regA = ProcessRegistry()
-            val regB = ProcessRegistry()
-            val ta = KotlinNodeTransport(nodeIdA, "", 0)
-            val tb = KotlinNodeTransport(nodeIdB, "", 0)
-            try {
-                tb.startAccepting(this, regB)
-                ta.startAccepting(this, regA)
-                val pool =
-                    Poolboy.startLink(
-                        this,
-                        PoolConfig(size = 1, maxOverflow = 0, name = poolName),
-                        testFactory(),
-                        homeNode = LocalNode(nodeIdB),
-                    )
-                regB.register(poolName, pool.ref)
-                ta.connectOut(this, regA, nodeIdB, "127.0.0.1", tb.boundPort)
-                val remote =
-                    Poolboy.resolve<CounterState>(
-                        PoolAddress.OnNode(poolName, nodeIdB),
-                        ta,
-                    )
-                val w1 = remote.checkout()!!
-                assertEquals(1, w1.call<Int>(Unit))
-                w1.checkin()
-                delay(50)
-                val w2 = remote.checkout()!!
-                assertEquals(2, w2.call<Int>(Unit))
-                w2.checkin()
-            } finally {
-                ta.close()
-                tb.close()
-                coroutineContext.job.cancelChildren()
+            val poolName = "tcp-checkin-${System.nanoTime()}"
+            TcpLoopbackPair().use { tcp ->
+                try {
+                    tcp.start(this)
+                    val pool =
+                        Poolboy.startLink(
+                            this,
+                            PoolConfig(size = 1, maxOverflow = 0, name = poolName),
+                            testFactory(),
+                            homeNode = tcp.localB,
+                        )
+                    tcp.regB.register(poolName, pool.ref)
+                    tcp.connect(this)
+                    val remote =
+                        Poolboy.resolve<CounterState>(
+                            PoolAddress.OnNode(poolName, tcp.nodeIdB),
+                            tcp.transportA,
+                        )
+                    val w1 = remote.checkout()!!
+                    assertEquals(1, w1.call<Int>(Unit))
+                    w1.checkin()
+                    delay(50)
+                    val w2 = remote.checkout()!!
+                    assertEquals(2, w2.call<Int>(Unit))
+                    w2.checkin()
+                } finally {
+                    tcp.cancelChildren(this)
+                }
             }
         }
 
     @Test
     fun pool_global_via_tcp_loopback(): Unit =
         runBlocking {
-            val suffix = System.nanoTime().toString()
-            val poolName = "tcp-global-$suffix"
-            val nodeIdA = NodeId("a-$suffix", "loopback")
-            val nodeIdB = NodeId("b-$suffix", "loopback")
-            val localA = LocalNode(nodeIdA)
-            val localB = LocalNode(nodeIdB)
-            val regA = ProcessRegistry()
-            val regB = ProcessRegistry()
-            val ta = KotlinNodeTransport(nodeIdA, "", 0)
-            val tb = KotlinNodeTransport(nodeIdB, "", 0)
-            try {
-                tb.startAccepting(this, regB)
-                ta.startAccepting(this, regA)
-                GlobalRegistry.install(tb, localB)
-                GlobalRegistry.useNode(localA)
-                val pool =
-                    Poolboy.startLink(
-                        this,
-                        PoolConfig(size = 1, maxOverflow = 0, name = poolName),
-                        testFactory(),
-                        homeNode = localB,
-                    )
-                regB.register(poolName, pool.ref)
-                ta.connectOut(this, regA, nodeIdB, "127.0.0.1", tb.boundPort)
-                delay(50)
-                GlobalRegistry.useNode(localB)
-                when (val reg = GlobalRegistry.registerName(poolName, pool.ref)) {
-                    is GlobalRegistry.RegisterResult.Ok -> { }
-                    is GlobalRegistry.RegisterResult.Conflict -> error("conflict: ${reg.existing}")
+            val poolName = "tcp-global-${System.nanoTime()}"
+            TcpLoopbackPair().use { tcp ->
+                try {
+                    tcp.start(this)
+                    GlobalRegistry.install(tcp.transportB, tcp.localB)
+                    GlobalRegistry.useNode(tcp.localA)
+                    val pool =
+                        Poolboy.startLink(
+                            this,
+                            PoolConfig(size = 1, maxOverflow = 0, name = poolName),
+                            testFactory(),
+                            homeNode = tcp.localB,
+                        )
+                    tcp.regB.register(poolName, pool.ref)
+                    tcp.connect(this)
+                    delay(50)
+                    GlobalRegistry.useNode(tcp.localB)
+                    when (val reg = GlobalRegistry.registerName(poolName, pool.ref)) {
+                        is GlobalRegistry.RegisterResult.Ok -> { }
+                        is GlobalRegistry.RegisterResult.Conflict ->
+                            error("conflict: ${reg.existing}")
+                    }
+                    delay(50)
+                    GlobalRegistry.useNode(tcp.localA)
+                    val remote =
+                        Poolboy.resolve<CounterState>(
+                            PoolAddress.Global(poolName),
+                            tcp.transportA,
+                        )
+                    remote.checkout()!!.useLease {
+                        assertEquals(1, call<Int>(Unit))
+                    }
+                } finally {
+                    tcp.cancelChildren(this)
                 }
-                delay(50)
-                GlobalRegistry.useNode(localA)
-                val remote =
-                    Poolboy.resolve<CounterState>(
-                        PoolAddress.Global(poolName),
-                        ta,
-                    )
-                val worker = remote.checkout()!!
-                assertEquals(1, worker.call<Int>(Unit))
-                worker.checkin()
-            } finally {
-                GlobalRegistry.reset()
-                ta.close()
-                tb.close()
-                coroutineContext.job.cancelChildren()
             }
         }
 

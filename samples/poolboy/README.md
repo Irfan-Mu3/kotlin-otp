@@ -11,7 +11,7 @@ Erlang sources mirrored, line-for-line where possible:
 ## Run it
 
 ```
-./gradlew :samples:poolboy:test           # 33-test matrix (~1s)
+./gradlew :samples:poolboy:test           # 34-test matrix (~1s)
 ./gradlew :samples:poolboy:run            # ExampleApp main: starts pool1+pool2, runs SQL, stops cleanly
 ```
 
@@ -29,7 +29,7 @@ Erlang sources mirrored, line-for-line where possible:
 | [`example/ExampleApp.kt`](src/main/kotlin/org/otpstudy/poolboy/example/ExampleApp.kt) | `example.erl`, `example.app` | Two-pool `SupervisorApplication` + `main` |
 | [`PoolWire.kt`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) | — | `@Serializable` pool RPC payloads for TCP |
 | [`PooledWorker.kt`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) | remote pid + `gen_server:call` | `LocalPooledWorker` / `RemotePooledWorker` handles |
-| [`PoolboyTest.kt`](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt) | poolboy `test/poolboy_tests.erl` (subset) | 33-test matrix |
+| [`PoolboyTest.kt`](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt) | poolboy `test/poolboy_tests.erl` (subset) | 34-test matrix |
 
 ## Erlang → Kotlin mapping
 
@@ -59,7 +59,7 @@ Erlang sources mirrored, line-for-line where possible:
 
 ## Test matrix
 
-33 tests (all green, ~1s, see [PoolboyTest.kt](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt)):
+34 tests (all green, ~1s, see [PoolboyTest.kt](src/test/kotlin/org/otpstudy/poolboy/PoolboyTest.kt)):
 
 Core poolboy behaviour:
 
@@ -114,6 +114,7 @@ TCP + global replication (round 5, kotlin-otp-only — no BEAM/jinterface):
 | # | Test | Asserts |
 |---|------|---------|
 | — | `pool_wire_roundtrip` | [`DistributionWire.encodeSerializable`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistributionWire.kt) round-trips [`WirePoolRequest`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) / [`WireCheckoutResult`](src/main/kotlin/org/otpstudy/poolboy/PoolWire.kt) |
+| — | `wire_checkout_retains_lease_until_checkin` | Wire checkout leaves `monitors=1`; [`ForwardCall`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) succeeds ([`BorrowerLease.Remote`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt)) |
 | 28 | `pool_checkout_via_tcp_loopback` | Two [`KotlinNodeTransport`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/KotlinNodeTransport.kt)s; remote checkout → [`RemotePooledWorker.call`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt) |
 | 29 | `pool_status_via_tcp_loopback` | Remote `status()` over TCP |
 | 30 | `tcp_checkin_returns_worker_to_pool` | Checkout → call → token checkin → second checkout |
@@ -172,7 +173,7 @@ Mirrors the remaining `poolboy:pool()` registration variants. Implemented in `sa
 3. **[`DistributionWire.encodeSerializable`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistributionWire.kt)** — registered `@Serializable` types round-trip as `JsonElement` (not `toString()`).
 4. **[`GlobalRegistry.install`](../../otp-global/src/main/kotlin/org/otpstudy/global/GlobalRegistry.kt)** — broadcast [`GlobalDistMsg`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/GlobalDistMsg.kt) on [`DistMsg.Global`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/DistMsg.kt); `syncPeers` on connect; remote `whereis` → [`RemoteGenServerRef`](../../otp-distribution/src/main/kotlin/org/otpstudy/distribution/RemoteGenServerRef.kt).
 
-**Remote borrower limitation:** TCP checkout cannot install a home-node monitor on the client's `Job` (no cross-JVM `Job`). Wire checkouts skip the borrower `invokeOnCompletion` hook; worker return relies on explicit `checkin`, `transaction` `finally`, and transport `call` timeout — not automatic return on client coroutine cancel. Follow-up: `WireBorrowerDown` cast from client on cancel.
+**Remote borrower limitation:** TCP checkout uses [`BorrowerLease.Remote`](src/main/kotlin/org/otpstudy/poolboy/PoolMessages.kt) — no home-node `Job` monitor. Return workers via [`PooledWorker.checkin`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt), [`useLease { }`](src/main/kotlin/org/otpstudy/poolboy/PooledWorker.kt), `transaction` `finally`, or transport `call` timeout — not automatic return on client coroutine cancel. Follow-up: `WireBorrowerDown` cast from client on cancel.
 
 **OTP divergence (documented):** global registration uses async broadcast + `syncPeers`, not synchronous OTP `multi_call` on every `register_name`; netsplit locker protocol is out of scope.
 

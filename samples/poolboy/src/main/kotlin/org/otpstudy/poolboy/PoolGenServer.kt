@@ -9,6 +9,7 @@ import kotlinx.coroutines.coroutineScope
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
 import org.otpstudy.core.OtpLogging
+import org.otpstudy.core.OtpStudyDebug
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.genserver.InfoMsg
@@ -44,7 +45,7 @@ internal data class SpawnedWorker<W>(val childId: String, val ref: GenServerRef<
 /** Per-borrower bookkeeping for a checked-out worker (poolboy `monitors` ETS row). */
 internal data class MonitorEntry<W>(
     val cref: CheckoutRef,
-    val borrower: Job,
+    val lease: BorrowerLease,
     val borrowerHook: DisposableHandle,
     val spawned: SpawnedWorker<W>,
 )
@@ -52,7 +53,7 @@ internal data class MonitorEntry<W>(
 /** Per-blocked-checkout bookkeeping (poolboy `waiting` queue entry). */
 internal data class WaitingItem<W>(
     val cref: CheckoutRef,
-    val borrower: Job,
+    val lease: BorrowerLease,
     val borrowerHook: DisposableHandle,
     val from: ReplyHandle<PoolState<W>>,
     val wireReply: Boolean,
@@ -278,19 +279,16 @@ internal class PoolGenServer<W>(
         from: ReplyHandle<PoolState<W>>,
         wireReply: Boolean,
     ): ReplyResult<PoolState<W>> {
-        val borrowerJob = req.borrower ?: from.callerJob
-        if (borrowerJob == null && !wireReply) {
-            error("checkout requires a borrower Job (implicit from GenServerRef.call or explicit)")
-        }
+        val lease = resolveBorrowerLease(req, from, wireReply)
         val taken = takeAvailable(state)
         if (taken != null) {
-            installMonitor(state, taken, req.cref, borrowerJob, skipBorrowerHook = wireReply)
+            installMonitor(state, taken, req.cref, lease)
             return checkoutReply(taken, req.cref, state, wireReply)
         }
         if (state.overflow < config.maxOverflow) {
             val spawned = workerHandler.spawn()
             state.overflow += 1
-            installMonitor(state, spawned, req.cref, borrowerJob, skipBorrowerHook = wireReply)
+            installMonitor(state, spawned, req.cref, lease)
             return checkoutReply(spawned, req.cref, state, wireReply)
         }
         if (!req.block) {
@@ -303,16 +301,24 @@ internal class PoolGenServer<W>(
                 ReplyResult.Reply(null, state)
             }
         }
-        val hook =
-            if (borrowerJob != null) {
-                installBorrowerHook(req.cref, borrowerJob)
-            } else {
-                noopBorrowerHook
-            }
         state.waiting.addLast(
-            WaitingItem(req.cref, borrowerJob ?: noopBorrowerJob, hook, from, wireReply),
+            WaitingItem(req.cref, lease, borrowerHookFor(lease, req.cref), from, wireReply),
         )
         return ReplyResult.DeferReply(from, state)
+    }
+
+    private fun resolveBorrowerLease(
+        req: PoolRequest.Checkout,
+        from: ReplyHandle<PoolState<W>>,
+        wireReply: Boolean,
+    ): BorrowerLease {
+        if (wireReply) return BorrowerLease.Remote
+        val job = req.borrower ?: from.callerJob
+        return if (job != null) {
+            BorrowerLease.Local(job)
+        } else {
+            error("checkout requires a borrower Job (implicit from GenServerRef.call or explicit)")
+        }
     }
 
     private fun checkoutReply(
@@ -349,6 +355,11 @@ internal class PoolGenServer<W>(
         val worker = state.crefIndex.remove(cref)
         if (worker != null) {
             val entry = state.monitors.remove(worker) ?: return
+            if (entry.lease is BorrowerLease.Remote) {
+                OtpStudyDebug.trace {
+                    "BorrowerDown for remote lease cref=$cref (unexpected — no hook should be registered)"
+                }
+            }
             entry.borrowerHook.dispose()
             handleAvailableSlot(entry.spawned, state)
             return
@@ -381,7 +392,7 @@ internal class PoolGenServer<W>(
         if (pending != null) {
             val replacement = workerHandler.spawn()
             state.monitors[replacement.ref] =
-                MonitorEntry(pending.cref, pending.borrower, pending.borrowerHook, replacement)
+                MonitorEntry(pending.cref, pending.lease, pending.borrowerHook, replacement)
             state.crefIndex[pending.cref] = replacement.ref
             replyCheckoutToWaiter(pending, replacement)
             return
@@ -419,7 +430,7 @@ internal class PoolGenServer<W>(
         val pending = state.waiting.removeFirstOrNull()
         if (pending != null) {
             state.monitors[spawned.ref] =
-                MonitorEntry(pending.cref, pending.borrower, pending.borrowerHook, spawned)
+                MonitorEntry(pending.cref, pending.lease, pending.borrowerHook, spawned)
             state.crefIndex[pending.cref] = spawned.ref
             replyCheckoutToWaiter(pending, spawned)
             return
@@ -443,23 +454,28 @@ internal class PoolGenServer<W>(
         state: PoolState<W>,
         spawned: SpawnedWorker<W>,
         cref: CheckoutRef,
-        borrower: Job?,
-        skipBorrowerHook: Boolean = false,
+        lease: BorrowerLease,
     ) {
-        val hook =
-            if (!skipBorrowerHook && borrower != null) {
-                installBorrowerHook(cref, borrower)
-            } else {
-                noopBorrowerHook
-            }
-        val job = borrower ?: noopBorrowerJob
-        state.monitors[spawned.ref] = MonitorEntry(cref, job, hook, spawned)
+        state.monitors[spawned.ref] =
+            MonitorEntry(cref, lease, borrowerHookFor(lease, cref), spawned)
         state.crefIndex[cref] = spawned.ref
+        assertCrefIndexed(state, cref)
+    }
+
+    private fun borrowerHookFor(lease: BorrowerLease, cref: CheckoutRef): DisposableHandle =
+        when (lease) {
+            is BorrowerLease.Local -> installBorrowerHook(cref, lease.job)
+            BorrowerLease.Remote -> NO_BORROWER_HOOK
+        }
+
+    private fun assertCrefIndexed(state: PoolState<W>, cref: CheckoutRef) {
+        check(cref in state.crefIndex) {
+            "checkout lost cref $cref before reply (keys=${state.crefIndex.keys})"
+        }
     }
 
     private companion object {
-        private val noopBorrowerJob = Job()
-        private val noopBorrowerHook: DisposableHandle = DisposableHandle { }
+        private val NO_BORROWER_HOOK: DisposableHandle = DisposableHandle { }
     }
 
     /**

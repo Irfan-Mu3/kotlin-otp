@@ -18,8 +18,6 @@ sealed class WirePoolRequest {
     data class Checkout(
         val cref: Long,
         val block: Boolean,
-        /** Remote checkouts cannot ship a borrower [kotlinx.coroutines.Job]. */
-        val borrowerPresent: Boolean = false,
     ) : WirePoolRequest()
 
     @Serializable
@@ -82,11 +80,7 @@ internal object PoolWire {
     fun toWire(req: PoolRequest): WirePoolRequest =
         when (req) {
             is PoolRequest.Checkout ->
-                WirePoolRequest.Checkout(
-                    req.cref,
-                    req.block,
-                    borrowerPresent = req.borrower != null,
-                )
+                WirePoolRequest.Checkout(req.cref, req.block)
             PoolRequest.Status -> WirePoolRequest.Status
             PoolRequest.Stop -> WirePoolRequest.Stop
             is PoolRequest.ForwardCall ->

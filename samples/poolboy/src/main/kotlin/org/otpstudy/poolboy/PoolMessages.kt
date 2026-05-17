@@ -69,6 +69,19 @@ class PoolStoppedException(
 internal typealias CheckoutRef = Long
 
 /**
+ * How the pool tracks the checkout borrower on the home node.
+ *
+ * - [Local]: same JVM — monitor the caller [Job] via `invokeOnCompletion` → [BorrowerDown].
+ * - [Remote]: cross-JVM wire checkout — no home-node [Job]; client must [PooledWorker.checkin]
+ *   or rely on call timeout (never register a sentinel [Job] hook).
+ */
+internal sealed class BorrowerLease {
+    data class Local(val job: Job) : BorrowerLease()
+
+    data object Remote : BorrowerLease()
+}
+
+/**
  * Pool gen_server protocol — typed alternatives to passing raw `Any` over the
  * mailbox. All requests carry the [CheckoutRef] that poolboy uses to correlate
  * `cancel_waiting` casts back to a specific blocked checkout.

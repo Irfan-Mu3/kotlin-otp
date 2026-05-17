@@ -29,12 +29,7 @@ class RemotePoolHandle<W>(
         borrower: Job?,
     ): PooledWorker<W>? {
         val cref = nextCheckoutRef()
-        val wire: WirePoolRequest =
-            WirePoolRequest.Checkout(
-                cref,
-                block,
-                borrowerPresent = borrower != null,
-            )
+        val wire: WirePoolRequest = WirePoolRequest.Checkout(cref, block)
         return try {
             decodeCheckoutWorker(
                 transport.call(node, poolName, DistributionWire.encodeSerializable(wire), timeout),
