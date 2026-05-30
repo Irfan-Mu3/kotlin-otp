@@ -4,11 +4,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.time.Duration.Companion.milliseconds
 
 private class HibernatingCounter : GenServer<Long> {
     override suspend fun init(self: GenServerRef<Long>) = InitResult.Ok(0L)
@@ -94,6 +96,40 @@ class HibernateTest {
         ref.cast("inc")        // normal handleCast -> state 3
         kotlinx.coroutines.delay(50)
         assertEquals(3L, ref.call("get"))
+        ref.stop()
+    }
+
+    @Test
+    fun `actor with hibernateAfter remains functional after idle timeout`() = runBlocking {
+        val ref = GenServers.startLink(
+            scope, HibernatingCounter(),
+            hibernateAfter = 50.milliseconds,
+        )
+        ref.cast("inc"); ref.cast("inc")
+        assertEquals(2L, ref.call("get"))
+
+        // Let the actor idle past hibernateAfter
+        delay(120)
+
+        // Actor must still be alive and process messages normally
+        ref.cast("inc")
+        delay(20)
+        assertEquals(3L, ref.call("get"))
+        ref.stop()
+    }
+
+    @Test
+    fun `actor cycles through multiple hibernateAfter timeouts without error`() = runBlocking {
+        val ref = GenServers.startLink(
+            scope, HibernatingCounter(),
+            hibernateAfter = 30.milliseconds,
+        )
+        // Three idle windows pass
+        delay(120)
+        // Actor still alive
+        ref.cast("inc")
+        delay(20)
+        assertEquals(1L, ref.call("get"))
         ref.stop()
     }
 }

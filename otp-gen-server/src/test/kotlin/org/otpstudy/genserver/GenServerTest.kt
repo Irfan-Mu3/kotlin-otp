@@ -351,4 +351,14 @@ class GenServerTest {
         assertEquals(2, resumed)
         scope.cancel()
     }
+
+    @Test
+    fun `startLinkDetached is not cancelled by parent scope cancellation`() = runBlocking {
+        val parent = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ref = GenServers.startLinkDetached(parent, SysTestServer(), name = "detached-gs")
+        parent.cancel()
+        delay(50)
+        assertTrue(ref.job.isActive)
+        ref.stop()
+    }
 }

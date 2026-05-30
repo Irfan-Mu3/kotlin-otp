@@ -13,7 +13,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
@@ -61,6 +63,8 @@ class ReplyHandle<S> internal constructor(
 ) {
     /** Complete the caller's reply. Returns false if already completed (caller timed out). */
     fun reply(response: Any?): Boolean = pending.complete(response)
+    /** True when a reply has already been completed (by timeout or explicit reply). */
+    val isCompleted: Boolean get() = pending.isCompleted
 }
 
 /**
@@ -161,6 +165,9 @@ class GenServerRef<S>(
     val isTrapExit: Boolean,
     internal val queueLen: AtomicInteger = AtomicInteger(0),
 ) {
+    /** Child scope tied to this server's lifecycle; useful for [OtpTimers]. */
+    val timerScope: CoroutineScope get() = CoroutineScope(job)
+
     suspend fun <R> call(request: Any, timeout: Duration = 5.seconds): R {
         // Capture outside withTimeout: the timeout scope's Job completes when the call returns,
         // which would otherwise make borrower hooks (e.g. poolboy) fire immediately after checkout.
@@ -301,6 +308,7 @@ object GenServers {
         reductionLimit: Int? = null,
         withArena: Boolean = false,
         fastReply: Boolean = false,
+        hibernateAfter: Duration? = null,
     ): GenServerRef<S> {
         val id = OtpProcessId.allocate()
         val mailbox: Channel<GenServerMsg> = when {
@@ -323,7 +331,7 @@ object GenServers {
             parent.launch(context + jobName + budget + arenaCtx, start = CoroutineStart.LAZY) {
                 try {
                     val self = refReady.await()
-                    runLoop(id, self, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen, fastReply)
+                    runLoop(id, self, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen, fastReply, hibernateAfter)
                 } finally {
                     coroutineContext[ActorArena]?.close()
                 }
@@ -337,6 +345,38 @@ object GenServers {
         }
         if (hookReg != null) job.invokeOnCompletion { hookReg.close() }
         return ref
+    }
+
+    /**
+     * Start a GenServer in a detached supervisor child scope.
+     *
+     * Unlike [startLink], this actor is not a structured child of [parent]'s [Job].
+     * Useful in tests where `runBlocking` should not wait for long-lived actors.
+     * Caller must explicitly stop the returned ref.
+     */
+    fun <S> startLinkDetached(
+        parent: CoroutineScope,
+        server: GenServer<S>,
+        context: CoroutineContext = Dispatchers.Default,
+        name: String? = null,
+        mailboxBound: MailboxBound? = null,
+        reductionLimit: Int? = null,
+        withArena: Boolean = false,
+        fastReply: Boolean = false,
+        hibernateAfter: Duration? = null,
+    ): GenServerRef<S> {
+        val detachedParent = CoroutineScope(parent.coroutineContext.minusKey(Job) + SupervisorJob())
+        return startLink(
+            detachedParent,
+            server,
+            context,
+            name,
+            mailboxBound,
+            reductionLimit,
+            withArena,
+            fastReply,
+            hibernateAfter,
+        )
     }
 
     /**
@@ -357,10 +397,11 @@ object GenServers {
         reductionLimit: Int? = null,
         withArena: Boolean = false,
         fastReply: Boolean = false,
+        hibernateAfter: Duration? = null,
     ): GenServerRef<S> {
         val initAck = CompletableDeferred<Result<Unit>>()
         val wrapped = ProcLibWrapper(server, initAck)
-        val ref = startLink(parent, wrapped, context, name, mailboxBound, reductionLimit, withArena, fastReply)
+        val ref = startLink(parent, wrapped, context, name, mailboxBound, reductionLimit, withArena, fastReply, hibernateAfter)
         initAck.await().getOrThrow()
         return ref
     }
@@ -401,6 +442,7 @@ object GenServers {
         budget: ReductionBudget,
         queueLen: AtomicInteger,
         fastReply: Boolean = false,
+        hibernateAfter: Duration? = null,
     ) {
         var currentServer = server
         var state: S = when (val init = currentServer.init(self)) {
@@ -559,7 +601,9 @@ object GenServers {
 
                 // 3. Block-wait on sys OR (if not suspended) the user mailbox.
                 //    This ensures sys messages are always processed even when the mailbox is idle.
-                val loopMsg: LoopMsg = select {
+                //    When hibernateAfter is set, the select times out and re-enters: analogous to
+                //    OTP's gen_server hibernate_after timer (erlang:hibernate/3 after idle period).
+                suspend fun awaitMsg(): LoopMsg = select {
                     sysMailbox.onReceiveCatching { r ->
                         val sys = r.getOrNull() ?: return@onReceiveCatching LoopMsg.ChannelClosed
                         handleOneSys(sys)
@@ -571,6 +615,13 @@ object GenServers {
                             LoopMsg.User(msg)
                         }
                     }
+                }
+                val loopMsg: LoopMsg = if (hibernateAfter != null) {
+                    // Timeout fires when no message arrives within hibernateAfter: re-enter
+                    // the blocking select indefinitely, mirroring OTP's hibernate_after semantics.
+                    withTimeoutOrNull(hibernateAfter) { awaitMsg() } ?: awaitMsg()
+                } else {
+                    awaitMsg()
                 }
 
                 when (loopMsg) {

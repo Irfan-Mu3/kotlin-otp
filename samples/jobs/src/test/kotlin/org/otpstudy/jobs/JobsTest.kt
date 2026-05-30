@@ -14,20 +14,24 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Test
+import org.otpstudy.testkit.withGenServer
 
 class JobsTest {
     private suspend fun CoroutineScope.withJobs(
         vararg queues: QueueSpec,
         block: suspend () -> Unit,
     ) {
-        Jobs.startLink(
-            this,
-            JobsConfig(queues = queues.toList(), defaultQueue = queues.firstOrNull()?.name),
-        )
         try {
-            block()
+            withGenServer(
+                start = {
+                    Jobs.startLink(
+                        this,
+                        JobsConfig(queues = queues.toList(), defaultQueue = queues.firstOrNull()?.name),
+                    ).ref
+                },
+                block = { block() },
+            )
         } finally {
-            Jobs.ref().stop()
             Jobs.resetForTests()
         }
     }

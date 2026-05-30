@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -17,6 +18,7 @@ import org.otpstudy.distribution.NodeId
 import org.otpstudy.distribution.RemoteNodeStub
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServerRef
+import org.otpstudy.genserver.GenServerRouters
 import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
 import org.otpstudy.genserver.MailboxBound
@@ -442,6 +444,48 @@ private fun runConcurrentCallersBenchmark(
 }
 
 // ---------------------------------------------------------------------------
+// Scenario G: gen_server_router_concurrent_callers_N_shards_M
+// N concurrent callers routing round-robin across M shards.
+// Validates that sharding reduces per-call latency at high concurrency.
+// ---------------------------------------------------------------------------
+
+private fun runRouterConcurrentCallersBenchmark(
+    scope: CoroutineScope,
+    callers: Int,
+    callsPerCaller: Int,
+    shards: Int,
+): BenchResult = runBlocking {
+    val router = GenServerRouters.startLink(scope, shards, factory = { EchoServer() })
+    repeat(2_000) { router.call<Any>("warmup") }
+
+    val latencies = ConcurrentLinkedQueue<Long>()
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            repeat(callers) {
+                async {
+                    repeat(callsPerCaller) {
+                        val dt = measureNanoTime { router.call<Any>("ping") }
+                        latencies.add(dt)
+                    }
+                }
+            }
+        }
+    }
+    router.stop()
+    val latencyList = latencies.toList()
+    BenchResult(
+        name = "gen_server_router_concurrent_callers_${callers}_shards_$shards",
+        iterations = latencyList.size,
+        p50Micros = percentile(latencyList, 50.0),
+        p95Micros = percentile(latencyList, 95.0),
+        p99Micros = percentile(latencyList, 99.0),
+        p999Micros = percentile(latencyList, 99.9),
+        throughputPerSec = latencyList.size * 1_000_000_000.0 / totalNanos,
+        notes = "$callers callers round-robin across $shards shards; compare to gen_server_call_concurrent_callers_$callers",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Scenario C: gen_server_call_bounded_mailbox_overflow
 // 500 concurrent senders burst into a mailbox capped at `capacity`. Reports
 // accepted vs rejected counts and latency of accepted calls.
@@ -454,28 +498,33 @@ private fun runBoundedMailboxOverflow(
 ): BenchResult = runBlocking {
     val bound = MailboxBound(capacity = capacity, policy = OverflowPolicy.CrashSender)
     val ref = GenServers.startLink(scope, EchoServer(), name = "bounded-overflow", mailboxBound = bound)
-    // warmup without overflow
     repeat(10) { ref.call<Any>("warmup") }
 
     val accepted = ConcurrentLinkedQueue<Long>()
-    var rejected = 0
+    val rejectedCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val readyLatch = java.util.concurrent.CountDownLatch(senders)
+    val startLatch = java.util.concurrent.CountDownLatch(1)
+
     val totalNanos = measureNanoTime {
         coroutineScope {
             repeat(senders) {
-                async {
+                launch(kotlinx.coroutines.Dispatchers.IO) {
+                    readyLatch.countDown()
+                    startLatch.await()
                     try {
                         val dt = measureNanoTime { ref.call<Any>("burst") }
                         accepted.add(dt)
                     } catch (_: MailboxFullException) {
-                        // rejection is expected under overflow
+                        rejectedCount.incrementAndGet()
                     }
                 }
             }
+            readyLatch.await()
+            startLatch.countDown()
         }
     }
     ref.stop()
     val acceptedList = accepted.toList()
-    rejected = senders - acceptedList.size
     val p95 = if (acceptedList.isNotEmpty()) percentile(acceptedList, 95.0) else 0.0
     val p99 = if (acceptedList.isNotEmpty()) percentile(acceptedList, 99.0) else 0.0
     BenchResult(
@@ -485,8 +534,8 @@ private fun runBoundedMailboxOverflow(
         p95Micros = p95,
         p99Micros = p99,
         p999Micros = 0.0,
-        throughputPerSec = acceptedList.size * 1_000_000_000.0 / totalNanos,
-        notes = "capacity=$capacity senders=$senders accepted=${acceptedList.size} rejected=$rejected; p99 of accepted=${p99.pretty()}us",
+        throughputPerSec = if (totalNanos > 0) acceptedList.size * 1_000_000_000.0 / totalNanos else 0.0,
+        notes = "capacity=$capacity senders=$senders accepted=${acceptedList.size} rejected=${rejectedCount.get()} barrier=CountDownLatch",
     )
 }
 
@@ -750,6 +799,12 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         // --- Scenario A: concurrent callers ---
         for (callers in profile.concurrentCallerCounts) {
             add(runConcurrentCallersBenchmark(scope, callers, profile.callsPerCaller))
+        }
+
+        // --- Scenario G: router concurrent callers (sharding vs single-actor) ---
+        val routerShards = minOf(profile.concurrentCallerCounts.last(), 10)
+        for (callers in profile.concurrentCallerCounts) {
+            add(runRouterConcurrentCallersBenchmark(scope, callers, profile.callsPerCaller, routerShards))
         }
 
         // --- Scenario C: bounded mailbox overflow ---

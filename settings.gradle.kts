@@ -8,6 +8,7 @@ pluginManagement {
 }
 
 include(
+    "otp-testkit",
     "otp-core",
     "otp-mailbox",
     "otp-gen-server",
@@ -34,4 +35,5 @@ include(
     "samples:poolboy",
     "samples:jobs",
     "samples:investigation",
+    "samples:benchmarks",
 )

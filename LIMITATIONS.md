@@ -16,6 +16,27 @@ This Kotlin layout **does not** reproduce the BEAM. It ports **OTP-shaped struct
 - **Hot code upgrade**, **distributed Erlang**, **ETS/Mnesia**, and the **SASL release handler** are out of scope for v0.
 - **[THE_HADAL_ZONE.md](THE_HADAL_ZONE.md)** (next roadmap: TCP clustering, JVM post-mortem, and related tooling) is **Kotlin-native only**; **Erlang/Elixir nodes, ETF, BEAM distribution wire, and jinterface-style bridges** are **not** goals of that roadmap.
 
+## Tail latency and GC
+
+The JVM's shared heap garbage collector introduces a structural tail-latency ceiling that this library cannot eliminate.
+
+**G1GC stop-the-world pauses:** JVM G1GC (the default collector) produces stop-the-world mixed-collection pauses ranging from **20 ms** (well-tuned, small heap) to **300 ms** (large heap under memory pressure). Production Akka and Pekko clusters have measured pauses of **80–125 ms** under normal operating conditions.
+
+**Cluster consequences:** During a GC pause, all actors on the affected node stop processing. In a clustered deployment:
+- Cluster heartbeat timeouts (typically 3–10 s) are usually not triggered by a single pause, but repeated pauses or pauses under memory pressure can approach the threshold.
+- A node that pauses while holding a distributed lock or acting as a singleton coordinator (global registry, shard coordinator) will block dependent nodes for the duration of the pause.
+- This is why BEAM-based systems (Discord, WhatsApp, Klarna) choose Erlang for their highest-reliability components — per-process GC means one process's collection does not stop any other.
+
+**BEAM contrast:** Erlang/OTP garbage-collects each process independently, bounded by per-process heap limits and reduction counts. Other processes continue executing through a neighbour's GC cycle. Tail latency on BEAM stays near the median with no spike — this property cannot be replicated on the JVM without per-thread allocation isolation, which the JVM does not provide.
+
+**Available mitigations (JVM-level, not library-level):**
+- **ZGC** (`-XX:+UseZGC`): concurrent collector with pause targets under 1 ms, but not zero; throughput overhead ~5–15%.
+- **Shenandoah** (`-XX:+UseShenandoahGC`): similar pause profile to ZGC; available on OpenJDK.
+- **Smaller heap**: reduces G1GC pause duration at the cost of more frequent collections.
+- **GC logging and tuning**: `-Xlog:gc*` to measure actual pause times in your deployment before assuming the worst.
+
+**Recommendation:** For latency-sensitive production deployments using kotlin-otp in a cluster, run ZGC or Shenandoah and measure p99 tail latency under your actual load. Do not rely on p50/p95 numbers alone — GC spikes appear in the tail. See `docs/investigation/benchmark-algorithm-analysis.md` section 2 (`gen_server_call_p99_tail_latency`) for the benchmark that makes this visible.
+
 ## Supervision (library semantics)
 
 - **`one_for_one`**, **`one_for_all`**, and **`rest_for_one`** are implemented in [`Supervisor.startLink`](otp-supervisor/src/main/kotlin/org/otpstudy/supervisor/Supervisor.kt) with a single coordinator coroutine; behaviour follows OTP intent but is not BEAM-identical.
