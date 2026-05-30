@@ -200,6 +200,12 @@ fun main(args: Array<String>) {
         roundResults += runPekkaConcurrentCallers(profile)
         roundResults += runPekkaSupervisorRestart(profile)
 
+        // --- Akka typed actors ---
+        roundResults += runAkkaCallRoundtrip(profile)
+        roundResults += runAkkaCastEnqueue(profile)
+        roundResults += runAkkaConcurrentCallers(profile)
+        roundResults += runAkkaSupervisorRestart(profile)
+
         // --- Vert.x EventBus ---
         roundResults += runVertxCallRoundtrip(profile)
         roundResults += runVertxCastEnqueue(profile)

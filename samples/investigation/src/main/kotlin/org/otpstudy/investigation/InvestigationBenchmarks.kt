@@ -16,6 +16,9 @@ import org.otpstudy.distribution.InMemoryTransport
 import org.otpstudy.distribution.LocalNode
 import org.otpstudy.distribution.NodeId
 import org.otpstudy.distribution.RemoteNodeStub
+import org.otpstudy.genserver.CachedReadRef
+import org.otpstudy.genserver.CacheableState
+import org.otpstudy.genserver.CachingGenServer
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.genserver.GenServerRouters
@@ -47,6 +50,7 @@ import kotlin.time.Duration.Companion.seconds
 
 private data class BenchResult(
     val name: String,
+    val phase: String = "steady",
     val iterations: Int,
     val p50Micros: Double,
     val p95Micros: Double,
@@ -76,6 +80,7 @@ private data class BenchProfile(
 
 private data class BenchAggregate(
     val scenario: String,
+    val phase: String,
     val rounds: Int,
     val meanP50Micros: Double,
     val stddevP50Micros: Double,
@@ -731,6 +736,58 @@ private fun runWorkerPoolCheckout(
 }
 
 // ---------------------------------------------------------------------------
+// Scenario J: gen_server_cached_read_callers_N
+// CachedReadRef non-suspending AtomicReference read vs gen_server:call for
+// read-heavy workloads. Actor writes via cast("inc"); callers read the cache.
+// ---------------------------------------------------------------------------
+
+private data class CounterState(val n: Int) : CacheableState<CounterState> {
+    override fun snapshot() = copy()
+}
+
+private class CounterServer : GenServer<CounterState> {
+    override suspend fun init(self: GenServerRef<CounterState>) = InitResult.Ok(CounterState(0))
+    override suspend fun handleCall(request: Any, state: CounterState): ReplyResult<CounterState> =
+        ReplyResult.Reply(state.n, state)
+    override suspend fun handleCast(request: Any, state: CounterState): NoreplyResult<CounterState> =
+        NoreplyResult.Noreply(CounterState(state.n + 1))
+}
+
+private fun runCachedReadBenchmark(scope: CoroutineScope, callers: Int, iterations: Int): BenchResult = runBlocking {
+    val cacheRef = CachedReadRef<CounterState>()
+    val ref = GenServers.startLink(scope, CachingGenServer(CounterServer(), cacheRef), name = "cached-read-bench")
+    // Prime the cache with at least one state publication
+    repeat(100) { ref.cast("inc") }
+    delay(10)
+    val latencies = ConcurrentLinkedQueue<Long>()
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            repeat(callers) {
+                async {
+                    val perCaller = iterations / callers
+                    repeat(perCaller) {
+                        val dt = measureNanoTime { cacheRef.readCached() }
+                        latencies.add(dt)
+                    }
+                }
+            }
+        }
+    }
+    ref.stop()
+    val latencyList = latencies.toList()
+    BenchResult(
+        name = "gen_server_cached_read_callers_$callers",
+        iterations = latencyList.size,
+        p50Micros = percentile(latencyList, 50.0),
+        p95Micros = percentile(latencyList, 95.0),
+        p99Micros = percentile(latencyList, 99.0),
+        p999Micros = percentile(latencyList, 99.9),
+        throughputPerSec = latencyList.size * 1_000_000_000.0 / totalNanos,
+        notes = "$callers readers; non-suspending AtomicReference read; compare to gen_server_call_concurrent_callers_$callers",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Profile configuration
 // ---------------------------------------------------------------------------
 
@@ -826,10 +883,16 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         for (callers in profile.poolCallerCounts) {
             add(runWorkerPoolCheckout(scope, profile.poolSize, callers, profile.poolHoldMs))
         }
+
+        // --- Scenario J: cached read (non-suspending AtomicReference vs call) ---
+        for (callers in profile.concurrentCallerCounts) {
+            add(runCachedReadBenchmark(scope, callers, profile.iterations))
+        }
     }
-    println("round=$round complete")
+    val phase = if (round == 1) "cold" else "steady"
+    println("round=$round phase=$phase complete")
     scope.cancel()
-    return results
+    return results.map { it.copy(phase = phase) }
 }
 
 // ---------------------------------------------------------------------------
@@ -837,13 +900,17 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
 // ---------------------------------------------------------------------------
 
 private fun aggregate(rounds: List<List<BenchResult>>): List<BenchAggregate> {
-    val byScenario = linkedMapOf<String, MutableList<BenchResult>>()
+    val byScenario = linkedMapOf<Pair<String, String>, MutableList<BenchResult>>()
     for (round in rounds) {
-        for (r in round) byScenario.getOrPut(r.name) { mutableListOf() }.add(r)
+        for (r in round) byScenario.getOrPut(r.name to r.phase) { mutableListOf() }.add(r)
     }
-    return byScenario.entries.map { (scenario, results) ->
+    return byScenario.entries.map { entry ->
+        val scenario = entry.key.first
+        val phase = entry.key.second
+        val results = entry.value
         BenchAggregate(
             scenario = scenario,
+            phase = phase,
             rounds = results.size,
             meanP50Micros = mean(results.map { it.p50Micros }),
             stddevP50Micros = stddev(results.map { it.p50Micros }),
@@ -863,14 +930,27 @@ fun main(args: Array<String>) {
     val roundResults = (1..profile.rounds).map { runRound(profile, it) }
     val perRoundRows = roundResults.flatMapIndexed { idx, rows -> rows.map { (idx + 1) to it } }
     println("profile=${profile.name},rounds=${profile.rounds},iterations=${profile.iterations}")
-    println("round,scenario,iterations,p50_us,p95_us,p99_us,p999_us,throughput_ops_sec,notes")
+    println("round,phase,scenario,iterations,p50_us,p95_us,p99_us,p999_us,throughput_ops_sec,notes")
     for ((round, r) in perRoundRows) {
         println(
-            "$round,${r.name},${r.iterations},${r.p50Micros.pretty()},${r.p95Micros.pretty()},${r.p99Micros.pretty()},${r.p999Micros.pretty()},${r.throughputPerSec.pretty()},${r.notes.replace(",", ";")}",
+            "$round,${r.phase},${r.name},${r.iterations},${r.p50Micros.pretty()},${r.p95Micros.pretty()},${r.p99Micros.pretty()},${r.p999Micros.pretty()},${r.throughputPerSec.pretty()},${r.notes.replace(",", ";")}",
         )
     }
-    println("summary_scenario,rounds,mean_p50_us,stddev_p50_us,mean_p95_us,stddev_p95_us,mean_p99_us,stddev_p99_us,mean_throughput_ops_sec,stddev_throughput_ops_sec,notes")
-    for (s in aggregate(roundResults)) {
+    val aggregates = aggregate(roundResults)
+    println("summary_scenario,phase,rounds,mean_p50_us,stddev_p50_us,mean_p95_us,stddev_p95_us,mean_p99_us,stddev_p99_us,mean_throughput_ops_sec,stddev_throughput_ops_sec,notes")
+    for (s in aggregates) {
+        println(
+            "${s.scenario},${s.phase},${s.rounds},${s.meanP50Micros.pretty()},${s.stddevP50Micros.pretty()},${s.meanP95Micros.pretty()},${s.stddevP95Micros.pretty()},${s.meanP99Micros.pretty()},${s.stddevP99Micros.pretty()},${s.meanThroughput.pretty()},${s.stddevThroughput.pretty()},${s.notes.replace(",", ";")}",
+        )
+    }
+
+    val steadyAggregates = aggregates.filter { it.phase == "steady" }
+    if (steadyAggregates.isEmpty()) {
+        println("steady_summary_note,unavailable (run with --rounds>=2 to compare steady-state windows)")
+        return
+    }
+    println("steady_summary_scenario,rounds,mean_p50_us,stddev_p50_us,mean_p95_us,stddev_p95_us,mean_p99_us,stddev_p99_us,mean_throughput_ops_sec,stddev_throughput_ops_sec,notes")
+    for (s in steadyAggregates) {
         println(
             "${s.scenario},${s.rounds},${s.meanP50Micros.pretty()},${s.stddevP50Micros.pretty()},${s.meanP95Micros.pretty()},${s.stddevP95Micros.pretty()},${s.meanP99Micros.pretty()},${s.stddevP99Micros.pretty()},${s.meanThroughput.pretty()},${s.stddevThroughput.pretty()},${s.notes.replace(",", ";")}",
         )
