@@ -42,6 +42,48 @@ class SelectiveMailbox<T>(private val channel: Channel<T>) {
     }
 
     /**
+     * Record the current saved-list boundary as a scan mark.
+     *
+     * Use together with [receiveFrom] to skip messages that arrived before the mark.
+     * This mirrors OTP's recv_mark optimization: a reply to a call can only arrive
+     * after the call was sent, so all messages before the mark are irrelevant and
+     * can be skipped in O(1) rather than re-scanned.
+     *
+     * Typical usage:
+     * ```
+     * val m = mailbox.mark()        // snapshot before dispatching the request
+     * channel.send(request)
+     * val reply = mailbox.receiveFrom(m) { it is Reply && it.ref == ref }
+     * ```
+     */
+    fun mark(): Int = saved.size
+
+    /**
+     * Receive the next message matching [matches], scanning only saved messages
+     * at index >= [from] and any new channel arrivals.
+     *
+     * Messages in saved[0..<from] are never examined, giving O(k) cost where k
+     * is the number of messages that arrived after [mark] was called rather than
+     * O(total saved). Non-matching channel messages are appended to saved as usual.
+     */
+    suspend fun receiveFrom(from: Int, matches: (T) -> Boolean): T {
+        var i = from
+        while (i < saved.size) {
+            val msg = saved[i]
+            if (matches(msg)) {
+                saved.removeAt(i)
+                return msg
+            }
+            i++
+        }
+        while (true) {
+            val msg = channel.receive()
+            if (matches(msg)) return msg
+            saved.addLast(msg)
+        }
+    }
+
+    /**
      * Flush all saved messages back to the channel (e.g., after a state change where
      * previously irrelevant messages become relevant again).
      */

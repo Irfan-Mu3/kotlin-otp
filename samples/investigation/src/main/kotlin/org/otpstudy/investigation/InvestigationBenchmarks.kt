@@ -4,7 +4,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.otpstudy.core.Restart
@@ -17,24 +19,37 @@ import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServerRef
 import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
+import org.otpstudy.genserver.MailboxBound
+import org.otpstudy.genserver.MailboxFullException
 import org.otpstudy.genserver.NoreplyResult
+import org.otpstudy.genserver.OverflowPolicy
 import org.otpstudy.genserver.ReplyResult
 import org.otpstudy.mailbox.SelectiveMailbox
 import org.otpstudy.supervisor.ChildSpec
+import org.otpstudy.supervisor.DynamicSupervisor
+import org.otpstudy.supervisor.DynamicSupervisorRef
+import org.otpstudy.supervisor.SimpleOneForOneTemplate
 import org.otpstudy.supervisor.Supervisor
 import org.otpstudy.supervisor.SupervisorFlags
 import org.otpstudy.supervisor.SupervisorStrategy
 import kotlinx.coroutines.channels.Channel
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.max
 import kotlin.math.sqrt
 import kotlin.system.measureNanoTime
 import kotlin.time.Duration.Companion.seconds
+
+// ---------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------
 
 private data class BenchResult(
     val name: String,
     val iterations: Int,
     val p50Micros: Double,
     val p95Micros: Double,
+    val p99Micros: Double = 0.0,
+    val p999Micros: Double = 0.0,
     val throughputPerSec: Double,
     val notes: String = "",
 )
@@ -42,10 +57,18 @@ private data class BenchResult(
 private data class BenchProfile(
     val name: String,
     val iterations: Int,
+    val tailIterations: Int,
     val selectiveDepths: List<Int>,
     val selectiveSamples: Int,
     val restartCrashes: Int,
     val memoryCasts: Int,
+    val concurrentCallerCounts: List<Int>,
+    val callsPerCaller: Int,
+    val poolSize: Int,
+    val poolCallerCounts: List<Int>,
+    val poolHoldMs: Long,
+    val boundedMailboxCapacity: Int,
+    val boundedMailboxSenders: Int,
     val rounds: Int,
 )
 
@@ -56,10 +79,16 @@ private data class BenchAggregate(
     val stddevP50Micros: Double,
     val meanP95Micros: Double,
     val stddevP95Micros: Double,
+    val meanP99Micros: Double,
+    val stddevP99Micros: Double,
     val meanThroughput: Double,
     val stddevThroughput: Double,
     val notes: String,
 )
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 private class EchoServer : GenServer<Int> {
     override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(0)
@@ -82,8 +111,28 @@ private fun percentile(values: List<Long>, pct: Double): Double {
     return sorted[max(0, idx)] / 1_000.0
 }
 
-private fun runCallBenchmark(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
-    val ref = GenServers.startLink(scope, EchoServer(), name = "call-bench")
+private fun Double.pretty(): String = "%.2f".format(this)
+
+private fun mean(values: List<Double>): Double = if (values.isEmpty()) 0.0 else values.sum() / values.size
+
+private fun stddev(values: List<Double>): Double {
+    if (values.size < 2) return 0.0
+    val m = mean(values)
+    val variance = values.sumOf { (it - m) * (it - m) } / values.size
+    return sqrt(variance)
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: gen_server_call_roundtrip (existing, extended with p99/p999)
+// ---------------------------------------------------------------------------
+
+private fun runCallBenchmark(
+    scope: CoroutineScope,
+    iterations: Int,
+    fastReply: Boolean = false,
+): BenchResult = runBlocking {
+    val benchName = if (fastReply) "gen_server_call_fastReply_roundtrip" else "gen_server_call_roundtrip"
+    val ref = GenServers.startLink(scope, EchoServer(), name = benchName, fastReply = fastReply)
     repeat(2_000) { ref.call<Any>("warmup") }
     val latencies = ArrayList<Long>(iterations)
     val totalNanos = measureNanoTime {
@@ -94,13 +143,52 @@ private fun runCallBenchmark(scope: CoroutineScope, iterations: Int): BenchResul
     }
     ref.stop()
     BenchResult(
-        name = "gen_server_call_roundtrip",
+        name = benchName,
         iterations = iterations,
         p50Micros = percentile(latencies, 50.0),
         p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
         throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+        notes = if (fastReply) "yield() after reply; reduces dispatcher round-trips on hot path" else "",
     )
 }
+
+// ---------------------------------------------------------------------------
+// Scenario B: gen_server_call_p99_tail_latency
+// Higher iteration count to expose GC-spike tail beyond p99.
+// ---------------------------------------------------------------------------
+
+private fun runTailLatencyBenchmark(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
+    val ref = GenServers.startLink(scope, EchoServer(), name = "tail-bench")
+    repeat(2_000) { ref.call<Any>("warmup") }
+    val latencies = ArrayList<Long>(iterations)
+    val totalNanos = measureNanoTime {
+        repeat(iterations) {
+            val dt = measureNanoTime { ref.call<Any>("ping") }
+            latencies.add(dt)
+        }
+    }
+    ref.stop()
+    val p50 = percentile(latencies, 50.0)
+    val p95 = percentile(latencies, 95.0)
+    val p99 = percentile(latencies, 99.0)
+    val p999 = percentile(latencies, 99.9)
+    BenchResult(
+        name = "gen_server_call_p99_tail_latency",
+        iterations = iterations,
+        p50Micros = p50,
+        p95Micros = p95,
+        p99Micros = p99,
+        p999Micros = p999,
+        throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+        notes = "tail: p99=${p99.pretty()}us p999=${p999.pretty()}us; GC spikes visible in p999",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: gen_server_cast_enqueue (existing)
+// ---------------------------------------------------------------------------
 
 private fun runCastBenchmark(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
     val ref = GenServers.startLink(scope, EchoServer(), name = "cast-bench")
@@ -113,17 +201,26 @@ private fun runCastBenchmark(scope: CoroutineScope, iterations: Int): BenchResul
             latencies.add(dt)
         }
     }
+    val drainStart = System.nanoTime()
     while (ref.call<Int>("count") < (2_000 + iterations)) delay(1)
+    val drainNanos = System.nanoTime() - drainStart
     ref.stop()
+    val drainThroughput = iterations * 1e9 / drainNanos
     BenchResult(
         name = "gen_server_cast_enqueue",
         iterations = iterations,
         p50Micros = percentile(latencies, 50.0),
         p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
         throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
-        notes = "throughput measures enqueue speed; processing drained via count call",
+        notes = "enqueue speed only; service throughput (drain rate): ${drainThroughput.pretty()} ops/s",
     )
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: selective_receive_depth_N (existing)
+// ---------------------------------------------------------------------------
 
 private fun runSelectiveReceive(depth: Int, samples: Int): BenchResult = runBlocking {
     val ch = Channel<Int>(Channel.UNLIMITED)
@@ -132,7 +229,6 @@ private fun runSelectiveReceive(depth: Int, samples: Int): BenchResult = runBloc
     ch.send(1)
     val latencies = ArrayList<Long>(samples)
     repeat(samples) {
-        // refill to keep scan cost shape stable across iterations
         repeat(depth) { ch.send(0) }
         ch.send(1)
         val dt = measureNanoTime {
@@ -148,10 +244,16 @@ private fun runSelectiveReceive(depth: Int, samples: Int): BenchResult = runBloc
         iterations = latencies.size,
         p50Micros = percentile(latencies, 50.0),
         p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
         throughputPerSec = latencies.size * 1_000_000_000.0 / total,
-        notes = "single matching message behind $depth non-matching messages",
+        notes = "single match behind $depth non-matching messages; O(n) saved-list scan",
     )
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: supervisor_restart_storm_recovery (existing)
+// ---------------------------------------------------------------------------
 
 private fun runSupervisorRestartStorm(scope: CoroutineScope): BenchResult = runBlocking {
     runSupervisorRestartStorm(scope, crashCount = 40)
@@ -188,6 +290,52 @@ private fun runSupervisorRestartStorm(scope: CoroutineScope, crashCount: Int): B
     )
 }
 
+// ---------------------------------------------------------------------------
+// Scenario: supervisor_single_restart_latency
+// 10 warmup crashes heat the JIT; then exactly 1 more crash is measured.
+// Isolates per-cycle restart cost from the cold-JIT overhead in the storm.
+// ---------------------------------------------------------------------------
+
+private fun runSingleRestartLatency(scope: CoroutineScope): BenchResult = runBlocking {
+    val starts = java.util.concurrent.atomic.AtomicInteger(0)
+    val warmupDone = CompletableDeferred<Unit>()
+    val settled = CompletableDeferred<Unit>()
+    val WARMUP = 10
+    val spec = ChildSpec(
+        id = "single-restart",
+        restart = Restart.Permanent,
+        shutdown = Shutdown.BrutalKill,
+    ) {
+        val n = starts.incrementAndGet()
+        when {
+            n <= WARMUP   -> error("warmup crash #$n")
+            n == WARMUP + 1 -> { warmupDone.complete(Unit); error("measured crash") }
+            else          -> { settled.complete(Unit); delay(Long.MAX_VALUE) }
+        }
+    }
+    val flags = SupervisorFlags(
+        strategy = SupervisorStrategy.OneForOne,
+        intensity = 200,
+        period = 30.seconds,
+    )
+    val ref = Supervisor.startLink(scope, flags, listOf(spec))
+    warmupDone.await()
+    val elapsed = measureNanoTime { settled.await() }
+    ref.shutdown()
+    BenchResult(
+        name = "supervisor_single_restart_latency",
+        iterations = 1,
+        p50Micros = elapsed / 1_000.0,
+        p95Micros = elapsed / 1_000.0,
+        throughputPerSec = 1e9 / elapsed,
+        notes = "one restart after $WARMUP JIT warmup cycles; isolates per-cycle cost from storm overhead",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: distribution_in_memory_call (existing)
+// ---------------------------------------------------------------------------
+
 private fun runDistributionOverhead(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
     val transport = InMemoryTransport()
     val nodeA = LocalNode(NodeId("node-a"))
@@ -213,9 +361,15 @@ private fun runDistributionOverhead(scope: CoroutineScope, iterations: Int): Ben
         iterations = iterations,
         p50Micros = percentile(latencies, 50.0),
         p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
         throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: mailbox_cast_memory_delta (existing)
+// ---------------------------------------------------------------------------
 
 private fun usedHeapBytes(): Long {
     val rt = Runtime.getRuntime()
@@ -244,16 +398,290 @@ private fun runMemoryPressure(scope: CoroutineScope, casts: Int): BenchResult = 
     )
 }
 
-private fun Double.pretty(): String = "%.2f".format(this)
+// ---------------------------------------------------------------------------
+// Scenario A: gen_server_call_concurrent_callers_N
+// N coroutines concurrently calling a single EchoServer; measures how serial
+// mailbox processing degrades per-call latency as contention grows.
+// ---------------------------------------------------------------------------
 
-private fun mean(values: List<Double>): Double = if (values.isEmpty()) 0.0 else values.sum() / values.size
+private fun runConcurrentCallersBenchmark(
+    scope: CoroutineScope,
+    callers: Int,
+    callsPerCaller: Int,
+): BenchResult = runBlocking {
+    val ref = GenServers.startLink(scope, EchoServer(), name = "concurrent-callers-$callers")
+    // warmup with sequential calls
+    repeat(500) { ref.call<Any>("warmup") }
 
-private fun stddev(values: List<Double>): Double {
-    if (values.size < 2) return 0.0
-    val m = mean(values)
-    val variance = values.sumOf { (it - m) * (it - m) } / values.size
-    return sqrt(variance)
+    val allLatencies = ConcurrentLinkedQueue<Long>()
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            repeat(callers) {
+                async {
+                    repeat(callsPerCaller) {
+                        val dt = measureNanoTime { ref.call<Any>("ping") }
+                        allLatencies.add(dt)
+                    }
+                }
+            }
+        }
+    }
+    ref.stop()
+    val latencies = allLatencies.toList()
+    val totalCalls = latencies.size
+    BenchResult(
+        name = "gen_server_call_concurrent_callers_$callers",
+        iterations = totalCalls,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = totalCalls * 1_000_000_000.0 / totalNanos,
+        notes = "$callers concurrent callers x $callsPerCaller calls each; latency grows with mailbox depth",
+    )
 }
+
+// ---------------------------------------------------------------------------
+// Scenario C: gen_server_call_bounded_mailbox_overflow
+// 500 concurrent senders burst into a mailbox capped at `capacity`. Reports
+// accepted vs rejected counts and latency of accepted calls.
+// ---------------------------------------------------------------------------
+
+private fun runBoundedMailboxOverflow(
+    scope: CoroutineScope,
+    capacity: Int,
+    senders: Int,
+): BenchResult = runBlocking {
+    val bound = MailboxBound(capacity = capacity, policy = OverflowPolicy.CrashSender)
+    val ref = GenServers.startLink(scope, EchoServer(), name = "bounded-overflow", mailboxBound = bound)
+    // warmup without overflow
+    repeat(10) { ref.call<Any>("warmup") }
+
+    val accepted = ConcurrentLinkedQueue<Long>()
+    var rejected = 0
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            repeat(senders) {
+                async {
+                    try {
+                        val dt = measureNanoTime { ref.call<Any>("burst") }
+                        accepted.add(dt)
+                    } catch (_: MailboxFullException) {
+                        // rejection is expected under overflow
+                    }
+                }
+            }
+        }
+    }
+    ref.stop()
+    val acceptedList = accepted.toList()
+    rejected = senders - acceptedList.size
+    val p95 = if (acceptedList.isNotEmpty()) percentile(acceptedList, 95.0) else 0.0
+    val p99 = if (acceptedList.isNotEmpty()) percentile(acceptedList, 99.0) else 0.0
+    BenchResult(
+        name = "gen_server_call_bounded_mailbox_overflow",
+        iterations = senders,
+        p50Micros = if (acceptedList.isNotEmpty()) percentile(acceptedList, 50.0) else 0.0,
+        p95Micros = p95,
+        p99Micros = p99,
+        p999Micros = 0.0,
+        throughputPerSec = acceptedList.size * 1_000_000_000.0 / totalNanos,
+        notes = "capacity=$capacity senders=$senders accepted=${acceptedList.size} rejected=$rejected; p99 of accepted=${p99.pretty()}us",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario D: selective_receive_ref_mark_comparison
+// Compares int-equality (existing baseline) vs reference-equality (===) on a
+// sealed type — analogous to OTP's {Ref, Reply} ref-mark optimization pattern.
+// Reference equality is O(1) per comparison; the scan loop cost is the same.
+// This isolates whether predicate evaluation cost is significant.
+// ---------------------------------------------------------------------------
+
+private sealed class TaggedMsg {
+    data class Tagged(val tag: Any, val payload: Int) : TaggedMsg()
+    data class Noise(val payload: Int) : TaggedMsg()
+}
+
+private fun runSelectiveReceiveRefMark(depth: Int, samples: Int): BenchResult = runBlocking {
+    val ch = Channel<TaggedMsg>(Channel.UNLIMITED)
+    val box = SelectiveMailbox(ch)
+    val tag = Any()
+
+    repeat(depth) { ch.send(TaggedMsg.Noise(0)) }
+    ch.send(TaggedMsg.Tagged(tag, 1))
+
+    val latencies = ArrayList<Long>(samples)
+    repeat(samples) {
+        repeat(depth) { ch.send(TaggedMsg.Noise(0)) }
+        ch.send(TaggedMsg.Tagged(tag, 1))
+        val dt = measureNanoTime {
+            box.receive { it is TaggedMsg.Tagged && it.tag === tag }
+            box.flushSaved()
+            repeat(depth + 1) { box.receive { true } }
+        }
+        latencies.add(dt)
+    }
+    val total = latencies.sum().toDouble()
+    BenchResult(
+        name = "selective_receive_ref_mark_depth_$depth",
+        iterations = latencies.size,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = latencies.size * 1_000_000_000.0 / total,
+        notes = "ref-equality (===) predicate; compare to selective_receive_depth_$depth for predicate cost isolation",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario F: selective_receive_mark_depth_N
+// Demonstrates O(1) receiveFrom(mark) when saved has `depth` pre-mark messages.
+// Setup: accumulate `depth` noise messages in saved before each sample so the
+// pre-mark queue is deep; the matching message arrives in the channel after the
+// mark, so receiveFrom scans 0 saved entries and 1 channel entry regardless of
+// depth.
+// ---------------------------------------------------------------------------
+
+private fun runSelectiveReceiveMark(depth: Int, samples: Int): BenchResult = runBlocking {
+    val ch = Channel<TaggedMsg>(Channel.UNLIMITED)
+    val box = SelectiveMailbox(ch)
+    val tag = Any()
+
+    // Accumulate `depth` noise messages in the saved list once before the loop.
+    // These simulate the pre-existing queue that receiveFrom must skip.
+    repeat(depth) { ch.send(TaggedMsg.Noise(0)) }
+    ch.send(TaggedMsg.Tagged(tag, 1))
+    box.receive { it is TaggedMsg.Tagged }  // drains channel; saves `depth` noises
+
+    val latencies = ArrayList<Long>(samples)
+    repeat(samples) {
+        // Mark: all `depth` noises are pre-mark and will be skipped.
+        val m = box.mark()
+        // Only the new matching message arrives after the mark.
+        ch.send(TaggedMsg.Tagged(tag, 1))
+        val dt = measureNanoTime {
+            box.receiveFrom(m) { it is TaggedMsg.Tagged && it.tag === tag }
+        }
+        latencies.add(dt)
+    }
+
+    // Cleanup saved list so the next benchmark starts clean.
+    box.flushSaved()
+    repeat(depth) { box.receive { true } }
+
+    val total = latencies.sum().toDouble()
+    BenchResult(
+        name = "selective_receive_mark_depth_$depth",
+        iterations = latencies.size,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = latencies.size * 1_000_000_000.0 / total,
+        notes = "mark set with $depth pre-mark noises in saved; match arrives in channel; O(1) scan",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario E: worker_pool_checkout_under_load
+// Inline minimal worker pool built on DynamicSupervisor. `poolSize` workers
+// are pre-warmed; `callers` coroutines concurrently check out a worker,
+// hold it for `holdMs`, then check in. Measures checkout latency only.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal inline worker pool backed by DynamicSupervisor + a channel-based
+ * semaphore. Avoids a cross-sample dependency on samples:poolboy while still
+ * exercising the DynamicSupervisor / structured-concurrency checkout pattern.
+ *
+ * Checkout: take a permit from the semaphore channel (blocks under full load).
+ * Checkin:  return the permit.
+ * Benchmark times only the checkout (permit acquisition) step.
+ */
+private class InlineWorkerPool(
+    scope: CoroutineScope,
+    poolSize: Int,
+) {
+    private val supervisor: DynamicSupervisorRef
+    private val permits = Channel<Unit>(poolSize)
+
+    init {
+        val template = SimpleOneForOneTemplate<Unit>(
+            restart = Restart.Permanent,
+            shutdown = Shutdown.BrutalKill,
+            start = { _, _, ready ->
+                ready(Unit)
+                delay(Long.MAX_VALUE)
+            },
+        )
+        val flags = SupervisorFlags(
+            strategy = SupervisorStrategy.OneForOne,
+            intensity = 10,
+            period = 5.seconds,
+        )
+        supervisor = DynamicSupervisor.startLink(scope, flags, template)
+    }
+
+    suspend fun warmUp(count: Int) {
+        repeat(count) {
+            supervisor.startChildSync<Unit>()
+            permits.send(Unit)
+        }
+    }
+
+    suspend fun checkout(): Unit = permits.receive()
+
+    fun checkin() { permits.trySend(Unit) }
+
+    suspend fun shutdown() = supervisor.shutdown()
+}
+
+private fun runWorkerPoolCheckout(
+    scope: CoroutineScope,
+    poolSize: Int,
+    callers: Int,
+    holdMs: Long,
+): BenchResult = runBlocking {
+    val pool = InlineWorkerPool(scope, poolSize)
+    pool.warmUp(poolSize)
+
+    val checkoutLatencies = ConcurrentLinkedQueue<Long>()
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            repeat(callers) {
+                async {
+                    // each caller does 10 checkout-hold-checkin cycles
+                    repeat(10) {
+                        val dt = measureNanoTime { pool.checkout() }
+                        checkoutLatencies.add(dt)
+                        if (holdMs > 0) delay(holdMs)
+                        pool.checkin()
+                    }
+                }
+            }
+        }
+    }
+    pool.shutdown()
+
+    val latencies = checkoutLatencies.toList()
+    val totalOps = latencies.size
+    BenchResult(
+        name = "worker_pool_checkout_callers_${callers}_pool_$poolSize",
+        iterations = totalOps,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = totalOps * 1_000_000_000.0 / totalNanos,
+        notes = "pool=$poolSize callers=$callers holdMs=$holdMs; industry target p95<1000us",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Profile configuration
+// ---------------------------------------------------------------------------
 
 private fun parseProfile(args: Array<String>): BenchProfile {
     val profileArg = args.firstOrNull { it.startsWith("--profile=") }?.substringAfter("=") ?: "quick"
@@ -262,41 +690,94 @@ private fun parseProfile(args: Array<String>): BenchProfile {
         "long" -> BenchProfile(
             name = "long",
             iterations = 50_000,
+            tailIterations = 100_000,
             selectiveDepths = listOf(1_000, 10_000, 25_000),
             selectiveSamples = 250,
             restartCrashes = 100,
             memoryCasts = 250_000,
+            concurrentCallerCounts = listOf(1, 10, 50, 100),
+            callsPerCaller = 2_000,
+            poolSize = 20,
+            poolCallerCounts = listOf(20, 50, 100),
+            poolHoldMs = 1L,
+            boundedMailboxCapacity = 100,
+            boundedMailboxSenders = 500,
             rounds = 5,
         )
         else -> BenchProfile(
             name = "quick",
             iterations = 20_000,
+            tailIterations = 50_000,
             selectiveDepths = listOf(1_000, 10_000),
             selectiveSamples = 100,
             restartCrashes = 40,
             memoryCasts = 100_000,
+            concurrentCallerCounts = listOf(1, 10, 50),
+            callsPerCaller = 500,
+            poolSize = 10,
+            poolCallerCounts = listOf(10, 30),
+            poolHoldMs = 1L,
+            boundedMailboxCapacity = 100,
+            boundedMailboxSenders = 300,
             rounds = 1,
         )
     }
     return if (roundsArg != null && roundsArg > 0) base.copy(rounds = roundsArg) else base
 }
 
+// ---------------------------------------------------------------------------
+// Round runner
+// ---------------------------------------------------------------------------
+
 private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
     val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     val results = buildList {
+        // --- Original scenarios (extended with p99/p999) ---
         add(runCallBenchmark(scope, profile.iterations))
+        add(runCallBenchmark(scope, profile.iterations, fastReply = true))
         add(runCastBenchmark(scope, profile.iterations))
         for (depth in profile.selectiveDepths) {
             add(runSelectiveReceive(depth = depth, samples = profile.selectiveSamples))
         }
         add(runSupervisorRestartStorm(scope, crashCount = profile.restartCrashes))
+        add(runSingleRestartLatency(scope))
         add(runDistributionOverhead(scope, profile.iterations))
         add(runMemoryPressure(scope, casts = profile.memoryCasts))
+
+        // --- Scenario B: tail latency ---
+        add(runTailLatencyBenchmark(scope, profile.tailIterations))
+
+        // --- Scenario A: concurrent callers ---
+        for (callers in profile.concurrentCallerCounts) {
+            add(runConcurrentCallersBenchmark(scope, callers, profile.callsPerCaller))
+        }
+
+        // --- Scenario C: bounded mailbox overflow ---
+        add(runBoundedMailboxOverflow(scope, profile.boundedMailboxCapacity, profile.boundedMailboxSenders))
+
+        // --- Scenario D: selective receive ref-mark comparison ---
+        for (depth in profile.selectiveDepths) {
+            add(runSelectiveReceiveRefMark(depth = depth, samples = profile.selectiveSamples))
+        }
+
+        // --- Scenario F: selective receive with mark (O(1) via receiveFrom) ---
+        for (depth in profile.selectiveDepths) {
+            add(runSelectiveReceiveMark(depth = depth, samples = profile.selectiveSamples))
+        }
+
+        // --- Scenario E: worker pool checkout under load ---
+        for (callers in profile.poolCallerCounts) {
+            add(runWorkerPoolCheckout(scope, profile.poolSize, callers, profile.poolHoldMs))
+        }
     }
     println("round=$round complete")
     scope.cancel()
     return results
 }
+
+// ---------------------------------------------------------------------------
+// Aggregation + output
+// ---------------------------------------------------------------------------
 
 private fun aggregate(rounds: List<List<BenchResult>>): List<BenchAggregate> {
     val byScenario = linkedMapOf<String, MutableList<BenchResult>>()
@@ -311,6 +792,8 @@ private fun aggregate(rounds: List<List<BenchResult>>): List<BenchAggregate> {
             stddevP50Micros = stddev(results.map { it.p50Micros }),
             meanP95Micros = mean(results.map { it.p95Micros }),
             stddevP95Micros = stddev(results.map { it.p95Micros }),
+            meanP99Micros = mean(results.map { it.p99Micros }),
+            stddevP99Micros = stddev(results.map { it.p99Micros }),
             meanThroughput = mean(results.map { it.throughputPerSec }),
             stddevThroughput = stddev(results.map { it.throughputPerSec }),
             notes = results.last().notes,
@@ -323,16 +806,16 @@ fun main(args: Array<String>) {
     val roundResults = (1..profile.rounds).map { runRound(profile, it) }
     val perRoundRows = roundResults.flatMapIndexed { idx, rows -> rows.map { (idx + 1) to it } }
     println("profile=${profile.name},rounds=${profile.rounds},iterations=${profile.iterations}")
-    println("round,scenario,iterations,p50_us,p95_us,throughput_ops_sec,notes")
+    println("round,scenario,iterations,p50_us,p95_us,p99_us,p999_us,throughput_ops_sec,notes")
     for ((round, r) in perRoundRows) {
         println(
-            "$round,${r.name},${r.iterations},${r.p50Micros.pretty()},${r.p95Micros.pretty()},${r.throughputPerSec.pretty()},${r.notes.replace(",", ";")}"
+            "$round,${r.name},${r.iterations},${r.p50Micros.pretty()},${r.p95Micros.pretty()},${r.p99Micros.pretty()},${r.p999Micros.pretty()},${r.throughputPerSec.pretty()},${r.notes.replace(",", ";")}",
         )
     }
-    println("summary_scenario,rounds,mean_p50_us,stddev_p50_us,mean_p95_us,stddev_p95_us,mean_throughput_ops_sec,stddev_throughput_ops_sec,notes")
+    println("summary_scenario,rounds,mean_p50_us,stddev_p50_us,mean_p95_us,stddev_p95_us,mean_p99_us,stddev_p99_us,mean_throughput_ops_sec,stddev_throughput_ops_sec,notes")
     for (s in aggregate(roundResults)) {
         println(
-            "${s.scenario},${s.rounds},${s.meanP50Micros.pretty()},${s.stddevP50Micros.pretty()},${s.meanP95Micros.pretty()},${s.stddevP95Micros.pretty()},${s.meanThroughput.pretty()},${s.stddevThroughput.pretty()},${s.notes.replace(",", ";")}"
+            "${s.scenario},${s.rounds},${s.meanP50Micros.pretty()},${s.stddevP50Micros.pretty()},${s.meanP95Micros.pretty()},${s.stddevP95Micros.pretty()},${s.meanP99Micros.pretty()},${s.stddevP99Micros.pretty()},${s.meanThroughput.pretty()},${s.stddevThroughput.pretty()},${s.notes.replace(",", ";")}",
         )
     }
 }

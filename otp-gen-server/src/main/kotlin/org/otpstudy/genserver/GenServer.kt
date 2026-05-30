@@ -14,6 +14,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.otpstudy.core.OtpLogContext
 import org.otpstudy.core.OtpLogLevel
 import org.otpstudy.core.OtpLogging
@@ -299,6 +300,7 @@ object GenServers {
         mailboxBound: MailboxBound? = null,
         reductionLimit: Int? = null,
         withArena: Boolean = false,
+        fastReply: Boolean = false,
     ): GenServerRef<S> {
         val id = OtpProcessId.allocate()
         val mailbox: Channel<GenServerMsg> = when {
@@ -321,7 +323,7 @@ object GenServers {
             parent.launch(context + jobName + budget + arenaCtx, start = CoroutineStart.LAZY) {
                 try {
                     val self = refReady.await()
-                    runLoop(id, self, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen)
+                    runLoop(id, self, server, mailbox, controlMailbox, sysMailbox, name, budget, queueLen, fastReply)
                 } finally {
                     coroutineContext[ActorArena]?.close()
                 }
@@ -354,10 +356,11 @@ object GenServers {
         mailboxBound: MailboxBound? = null,
         reductionLimit: Int? = null,
         withArena: Boolean = false,
+        fastReply: Boolean = false,
     ): GenServerRef<S> {
         val initAck = CompletableDeferred<Result<Unit>>()
         val wrapped = ProcLibWrapper(server, initAck)
-        val ref = startLink(parent, wrapped, context, name, mailboxBound, reductionLimit, withArena)
+        val ref = startLink(parent, wrapped, context, name, mailboxBound, reductionLimit, withArena, fastReply)
         initAck.await().getOrThrow()
         return ref
     }
@@ -397,6 +400,7 @@ object GenServers {
         actorName: String?,
         budget: ReductionBudget,
         queueLen: AtomicInteger,
+        fastReply: Boolean = false,
     ) {
         var currentServer = server
         var state: S = when (val init = currentServer.init(self)) {
@@ -587,6 +591,10 @@ object GenServers {
                                     @Suppress("UNCHECKED_CAST") val ns = r.newState as S
                                     state = ns
                                     if (!msg.reply.isCompleted) msg.reply.complete(r.response)
+                                    // Cooperative yield: allows the caller's await() continuation to be
+                                    // scheduled on the same dispatcher thread immediately, reducing
+                                    // dispatcher round-trips from 4 to 3 on the reply path.
+                                    if (fastReply) yield()
                                 }
                                 is ReplyResult.DeferReply<*> -> {
                                     @Suppress("UNCHECKED_CAST") val ns = r.newState as S; state = ns

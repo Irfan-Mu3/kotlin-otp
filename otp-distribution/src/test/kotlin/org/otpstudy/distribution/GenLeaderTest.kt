@@ -95,7 +95,9 @@ class GenLeaderTest {
         val peers = listOf(NodeId("node-a", "h"), NodeId("node-b", "h"), NodeId("node-b", "h"))
         val ref = GenLeaders.startLink(scope, LeaderProbeCallbacks(), localNode = local, peers = peers, name = "leader-c")
 
-        repeat(5) { ref.cast(LeaderMsg.Elect()) }
+        // Saturate with high-term elections; term fencing ensures only the latest wins.
+        val currentTerm = leaderState(ref).term
+        repeat(5) { i -> ref.cast(LeaderMsg.Elect(term = currentTerm + i + 1)) }
         delay(100)
 
         val state = leaderState(ref)
@@ -164,7 +166,10 @@ class GenLeaderTest {
         assertEquals(nodeC, leaderState(refB).leader)
 
         // Only A observes nodeC as down in this local model.
-        refA.cast(LeaderMsg.Elect(exclude = nodeC))
+        // Use a term higher than the current settled term (which is ≥ 2 after startup).
+        // Without transport, each node still elects independently, so divergence is possible.
+        val currentTerm = leaderState(refA).term
+        refA.cast(LeaderMsg.Elect(exclude = nodeC, term = currentTerm + 1))
         delay(100)
 
         val a = leaderState(refA)
