@@ -213,8 +213,42 @@ private class DynamicChildSlot(
 }
 
 object DynamicSupervisor {
+    data class MetricsSnapshot(
+        val syncStarts: Long,
+        val syncStartSuccess: Long,
+        val syncStartFailure: Long,
+        val pendingSyncHighWatermark: Long,
+        val reconciliationRetries: Long,
+        val restartEvents: Long,
+    )
+
     private val epochSeq = AtomicLong(1L)
     private val idSeq = AtomicLong(0L)
+    private val syncStarts = AtomicLong(0L)
+    private val syncStartSuccess = AtomicLong(0L)
+    private val syncStartFailure = AtomicLong(0L)
+    private val pendingSyncHighWatermark = AtomicLong(0L)
+    private val reconciliationRetries = AtomicLong(0L)
+    private val restartEvents = AtomicLong(0L)
+
+    fun resetMetrics() {
+        syncStarts.set(0L)
+        syncStartSuccess.set(0L)
+        syncStartFailure.set(0L)
+        pendingSyncHighWatermark.set(0L)
+        reconciliationRetries.set(0L)
+        restartEvents.set(0L)
+    }
+
+    fun metricsSnapshot(): MetricsSnapshot =
+        MetricsSnapshot(
+            syncStarts = syncStarts.get(),
+            syncStartSuccess = syncStartSuccess.get(),
+            syncStartFailure = syncStartFailure.get(),
+            pendingSyncHighWatermark = pendingSyncHighWatermark.get(),
+            reconciliationRetries = reconciliationRetries.get(),
+            restartEvents = restartEvents.get(),
+        )
 
     fun startLink(
         parent: CoroutineScope,
@@ -301,6 +335,10 @@ object DynamicSupervisor {
                             slot.syncHandshakeActive = true
                             slot.pendingSyncReply = event.reply
                             pendingSyncReplies += event.reply
+                            syncStarts.incrementAndGet()
+                            pendingSyncHighWatermark.accumulateAndGet(pendingSyncReplies.size.toLong()) { a, b ->
+                                if (a > b) a else b
+                            }
                             startDynamicWorker(
                                 slot,
                                 supervisorScope,
@@ -371,6 +409,7 @@ object DynamicSupervisor {
                             val slot = children[event.childId]
                             event.result.fold(
                                 onSuccess = { value ->
+                                    syncStartSuccess.incrementAndGet()
                                     if (slot != null && slot.startEpoch == event.startEpoch) {
                                         slot.pendingSyncReply = null
                                         slot.syncHandshakeActive = false
@@ -380,6 +419,7 @@ object DynamicSupervisor {
                                     }
                                 },
                                 onFailure = { ex ->
+                                    syncStartFailure.incrementAndGet()
                                     if (slot != null && slot.startEpoch == event.startEpoch) {
                                         slot.lastSyncStartFailedEpoch = event.startEpoch
                                         children.remove(event.childId)
@@ -413,6 +453,7 @@ object DynamicSupervisor {
                             if (event.kind == ExitKind.Normal && slot.syncHandshakeActive) {
                                 var bail = false
                                 repeat(64) {
+                                    reconciliationRetries.incrementAndGet()
                                     yield()
                                     when (val s = children[event.id]) {
                                         null -> {
@@ -475,6 +516,7 @@ object DynamicSupervisor {
 
                             val restartNow = System.nanoTime()
                             slot.restartTimestampsNanos.add(restartNow)
+                            restartEvents.incrementAndGet()
                             if (flags.intensityScope == RestartIntensityScope.SupervisorWide) {
                                 supervisorRestartTimestamps.add(restartNow)
                             }

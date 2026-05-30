@@ -6,6 +6,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.otpstudy.core.Restart
 import org.otpstudy.core.Shutdown
@@ -231,5 +232,187 @@ class DynamicSupervisorTest {
                 ref.shutdown()
             }
         }
+    }
+
+    @Test
+    fun supervisorWideIntensityExceededCancelsDynamicSupervisor() = runBlocking {
+        val template =
+            SimpleOneForOneTemplate<Unit>(
+                restart = Restart.Permanent,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, _ ->
+                error("always crash")
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(
+                    strategy = SupervisorStrategy.OneForOne,
+                    intensity = 1,
+                    period = 5.seconds,
+                    intensityScope = RestartIntensityScope.SupervisorWide,
+                ),
+                template,
+            )
+
+        ref.startChild()
+        withTimeout(2.seconds) { ref.job.join() }
+        assertTrue(ref.job.isCancelled, "dynamic supervisor should cancel when supervisor-wide intensity is exceeded")
+    }
+
+    @Test
+    fun startChildSyncReadyCalledTwiceCompletesAndDoesNotLeakChild() = runBlocking {
+        val template =
+            SimpleOneForOneTemplate<String>(
+                restart = Restart.Temporary,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, ready ->
+                ready("first")
+                ready("second")
+                delay(Long.MAX_VALUE)
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(intensity = 10, period = 60.seconds),
+                template,
+            )
+
+        withTimeout(2.seconds) {
+            kotlin.runCatching { ref.startChildSync<String>(timeout = 1.seconds) }
+        }
+        withTimeout(2.seconds) {
+            while (ref.countChildren() != 0) yield()
+        }
+        ref.shutdown()
+    }
+
+    @Test
+    fun syncStartReadyThenImmediateNormalExitDoesNotLeakTemporaryChild() = runBlocking {
+        val template =
+            SimpleOneForOneTemplate<Unit>(
+                restart = Restart.Temporary,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, ready ->
+                ready(Unit)
+                // immediate normal completion
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(intensity = 50, period = 60.seconds),
+                template,
+            )
+
+        repeat(20) {
+            ref.startChildSync<Unit>(timeout = 1.seconds)
+        }
+        withTimeout(2.seconds) {
+            while (ref.countChildren() != 0) yield()
+        }
+        ref.shutdown()
+    }
+
+    @Test
+    fun concurrentImmediateNormalExitSyncStartsDoNotAccumulateStaleChildren() = runBlocking {
+        val template =
+            SimpleOneForOneTemplate<Unit>(
+                restart = Restart.Temporary,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, ready ->
+                ready(Unit)
+                // immediate normal completion
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(intensity = 100, period = 60.seconds),
+                template,
+            )
+
+        coroutineScope {
+            val jobs = List(30) { async { ref.startChildSync<Unit>(timeout = 2.seconds) } }
+            withTimeout(3.seconds) { jobs.awaitAll() }
+        }
+        withTimeout(2.seconds) {
+            while (ref.countChildren() != 0) yield()
+        }
+        ref.shutdown()
+    }
+
+    @Test
+    fun longRunSyncChurnWithMixedOutcomesDoesNotLeakChildren() = runBlocking {
+        val cycle = java.util.concurrent.atomic.AtomicInteger(0)
+        val template =
+            SimpleOneForOneTemplate<Unit>(
+                restart = Restart.Temporary,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, ready ->
+                when (cycle.incrementAndGet() % 3) {
+                    0 -> {
+                        ready(Unit)
+                        // immediate normal completion
+                    }
+                    1 -> delay(300.milliseconds) // forces timeout for short sync timeout
+                    else -> error("intentional pre-ready failure")
+                }
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(intensity = 200, period = 60.seconds),
+                template,
+            )
+
+        repeat(120) {
+            kotlin.runCatching { ref.startChildSync<Unit>(timeout = 100.milliseconds) }
+        }
+        withTimeout(5.seconds) {
+            while (ref.countChildren() != 0) yield()
+        }
+        assertEquals(0, ref.countChildren())
+        ref.shutdown()
+    }
+
+    @Test
+    fun concurrentLongRunSyncChurnBoundedAndResponsive() = runBlocking {
+        val cycle = java.util.concurrent.atomic.AtomicInteger(0)
+        val template =
+            SimpleOneForOneTemplate<Unit>(
+                restart = Restart.Temporary,
+                shutdown = Shutdown.BrutalKill,
+            ) { _, _, ready ->
+                when (cycle.incrementAndGet() % 4) {
+                    0 -> ready(Unit)
+                    1 -> delay(250.milliseconds) // likely timeout
+                    2 -> error("intentional fail")
+                    else -> {
+                        ready(Unit)
+                        delay(10.milliseconds)
+                    }
+                }
+            }
+        val ref =
+            DynamicSupervisor.startLink(
+                this,
+                SupervisorFlags(intensity = 300, period = 60.seconds),
+                template,
+            )
+
+        coroutineScope {
+            val jobs = List(8) {
+                async {
+                    repeat(30) {
+                        kotlin.runCatching { ref.startChildSync<Unit>(timeout = 100.milliseconds) }
+                    }
+                }
+            }
+            withTimeout(15.seconds) { jobs.awaitAll() }
+        }
+        withTimeout(5.seconds) {
+            while (ref.countChildren() != 0) yield()
+        }
+        assertEquals(0, ref.countChildren())
+        ref.shutdown()
     }
 }

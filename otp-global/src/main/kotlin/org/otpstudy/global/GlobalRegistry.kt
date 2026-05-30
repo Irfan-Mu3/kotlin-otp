@@ -13,6 +13,7 @@ import org.otpstudy.distribution.RemoteGenServerRef
 import org.otpstudy.distribution.toWire
 import org.otpstudy.genserver.GenServerRef
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Distributed global name registry — OTP's `global` module for kotlin-otp.
@@ -22,9 +23,20 @@ import java.util.concurrent.ConcurrentHashMap
  * a local [GenServerRef] or [RemoteGenServerRef].
  */
 object GlobalRegistry {
+    data class MetricsSnapshot(
+        val remoteRegistersApplied: Long,
+        val remoteUnregistersApplied: Long,
+        val staleMessagesDropped: Long,
+        val snapshotsProcessed: Long,
+        val syncBroadcasts: Long,
+        val lastSyncBroadcastLatencyMillis: Long?,
+    )
+
     private data class NodeView(
         val local: ConcurrentHashMap<String, GenServerRef<*>> = ConcurrentHashMap(),
         val remote: ConcurrentHashMap<String, RemoteEntry> = ConcurrentHashMap(),
+        val localVersions: ConcurrentHashMap<String, Long> = ConcurrentHashMap(),
+        val observedVersions: ConcurrentHashMap<String, Long> = ConcurrentHashMap(),
     )
 
     data class RemoteEntry(
@@ -34,6 +46,13 @@ object GlobalRegistry {
     )
 
     private val views = ConcurrentHashMap<NodeId, NodeView>()
+    private val remoteRegistersApplied = AtomicLong(0L)
+    private val remoteUnregistersApplied = AtomicLong(0L)
+    private val staleMessagesDropped = AtomicLong(0L)
+    private val snapshotsProcessed = AtomicLong(0L)
+    private val syncBroadcasts = AtomicLong(0L)
+    private val lastSyncBroadcastAtNanos = AtomicLong(0L)
+    private val lastSyncLatencyMillis = AtomicLong(-1L)
 
     /** Single-JVM default when [install] was not called. */
     private val defaultNode = NodeId("local", "jvm")
@@ -143,21 +162,51 @@ object GlobalRegistry {
         activeNode = null
         GlobalReplicationBus.handler = null
         GlobalReplicationBus.onPeerConnected = null
+        resetMetrics()
+    }
+
+    fun metricsSnapshot(): MetricsSnapshot =
+        MetricsSnapshot(
+            remoteRegistersApplied = remoteRegistersApplied.get(),
+            remoteUnregistersApplied = remoteUnregistersApplied.get(),
+            staleMessagesDropped = staleMessagesDropped.get(),
+            snapshotsProcessed = snapshotsProcessed.get(),
+            syncBroadcasts = syncBroadcasts.get(),
+            lastSyncBroadcastLatencyMillis = lastSyncLatencyMillis.get().takeIf { it >= 0L },
+        )
+
+    fun resetMetrics() {
+        remoteRegistersApplied.set(0L)
+        remoteUnregistersApplied.set(0L)
+        staleMessagesDropped.set(0L)
+        snapshotsProcessed.set(0L)
+        syncBroadcasts.set(0L)
+        lastSyncBroadcastAtNanos.set(0L)
+        lastSyncLatencyMillis.set(-1L)
     }
 
     private fun currentNode(): NodeId = activeNode ?: defaultNode
 
     private fun currentView(): NodeView = views.getOrPut(currentNode()) { NodeView() }
 
+    private fun nextLocalVersion(name: String): Long {
+        val view = currentView()
+        val next = (view.localVersions[name] ?: 0L) + 1L
+        view.localVersions[name] = next
+        return next
+    }
+
     private fun broadcastRegister(name: String, ref: GenServerRef<*>) {
         val node = currentNode()
         if (transport == null) return
+        val version = nextLocalVersion(name)
         val msg =
             GlobalDistMsg.Register(
                 name = name,
                 homeNode = node.toWire(),
                 localName = name,
                 processId = ref.id.value,
+                version = version,
             )
         runBlocking { transport?.broadcastGlobal(msg) }
     }
@@ -165,32 +214,62 @@ object GlobalRegistry {
     private fun broadcastUnregister(name: String, processId: OtpProcessId) {
         val node = currentNode()
         if (transport == null) return
+        val version = nextLocalVersion(name)
         val msg =
             GlobalDistMsg.Unregister(
                 name = name,
                 homeNode = node.toWire(),
                 processId = processId.value,
+                version = version,
             )
         runBlocking { transport?.broadcastGlobal(msg) }
     }
 
     private fun onDistMessage(msg: GlobalDistMsg, fromNode: NodeId) {
         when (msg) {
-            is GlobalDistMsg.Register -> applyRemoteRegister(msg)
+            is GlobalDistMsg.Register -> {
+                if (applyRemoteRegister(msg)) {
+                    remoteRegistersApplied.incrementAndGet()
+                } else {
+                    staleMessagesDropped.incrementAndGet()
+                }
+            }
             is GlobalDistMsg.Unregister -> {
+                var applied = false
                 for (v in views.values) {
+                    val current = v.observedVersions[msg.name] ?: 0L
+                    if (msg.version <= current) {
+                        continue
+                    }
+                    v.observedVersions[msg.name] = msg.version
                     v.remote.remove(msg.name)
+                    applied = true
+                }
+                if (applied) {
+                    remoteUnregistersApplied.incrementAndGet()
+                } else {
+                    staleMessagesDropped.incrementAndGet()
                 }
             }
             is GlobalDistMsg.SyncSnapshot -> {
+                snapshotsProcessed.incrementAndGet()
+                val startedAt = lastSyncBroadcastAtNanos.get()
+                if (startedAt > 0L) {
+                    val millis = (System.nanoTime() - startedAt) / 1_000_000L
+                    lastSyncLatencyMillis.set(millis)
+                }
                 for (entry in msg.entries) {
-                    applyRemoteRegister(entry)
+                    if (applyRemoteRegister(entry)) {
+                        remoteRegistersApplied.incrementAndGet()
+                    } else {
+                        staleMessagesDropped.incrementAndGet()
+                    }
                 }
             }
         }
     }
 
-    private fun applyRemoteRegister(msg: GlobalDistMsg.Register) {
+    private fun applyRemoteRegister(msg: GlobalDistMsg.Register): Boolean {
         val home = parseHome(msg.homeNode)
         val incoming =
             RemoteEntry(
@@ -198,8 +277,12 @@ object GlobalRegistry {
                 localName = msg.localName,
                 processId = OtpProcessId(msg.processId),
             )
+        var applied = false
         for ((nodeId, view) in views) {
             if (nodeId == home) continue
+            val currentVersion = view.observedVersions[msg.name] ?: 0L
+            if (msg.version <= currentVersion) continue
+            view.observedVersions[msg.name] = msg.version
             val existingLocal = view.local[msg.name]
             if (existingLocal != null) {
                 when (conflictResolver) {
@@ -216,7 +299,9 @@ object GlobalRegistry {
             } else {
                 view.remote[msg.name] = incoming
             }
+            applied = true
         }
+        return applied
     }
 
     private fun syncPeers() {
@@ -225,14 +310,18 @@ object GlobalRegistry {
         val view = views[node] ?: return
         val entries =
             view.local.map { (name, ref) ->
+                val version = view.localVersions[name] ?: 0L
                 GlobalDistMsg.Register(
                     name = name,
                     homeNode = node.toWire(),
                     localName = name,
                     processId = ref.id.value,
+                    version = version,
                 )
             }
         if (entries.isEmpty()) return
+        syncBroadcasts.incrementAndGet()
+        lastSyncBroadcastAtNanos.set(System.nanoTime())
         runBlocking { transport?.broadcastGlobal(GlobalDistMsg.SyncSnapshot(entries)) }
     }
 

@@ -15,6 +15,7 @@ sealed class GlobalDistMsg {
         val homeNode: String,
         val localName: String,
         val processId: Long,
+        val version: Long,
     ) : GlobalDistMsg()
 
     @Serializable
@@ -23,6 +24,7 @@ sealed class GlobalDistMsg {
         val name: String,
         val homeNode: String,
         val processId: Long,
+        val version: Long,
     ) : GlobalDistMsg()
 
     /** Full snapshot exchanged on [GlobalReplicationBus.syncPeers]. */

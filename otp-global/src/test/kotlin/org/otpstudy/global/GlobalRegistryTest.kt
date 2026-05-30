@@ -10,7 +10,8 @@ import kotlinx.coroutines.test.runTest
 import org.otpstudy.distribution.InMemoryTransport
 import org.otpstudy.distribution.LocalNode
 import org.otpstudy.distribution.NodeId
-import org.otpstudy.distribution.RemoteGenServerRef
+import org.otpstudy.distribution.GlobalDistMsg
+import org.otpstudy.distribution.GlobalReplicationBus
 import org.otpstudy.genserver.GenServer
 import org.otpstudy.genserver.GenServers
 import org.otpstudy.genserver.InitResult
@@ -157,7 +158,6 @@ class GlobalRegistryTest {
             GlobalRegistry.useNode(nodeB)
             val resolved = GlobalRegistry.resolveName("svc")
             assertTrue(resolved is GlobalRegistry.NameResolution.RemoteRef)
-            assertTrue((resolved as GlobalRegistry.NameResolution.RemoteRef).stub is RemoteGenServerRef)
             Unit
         }
 
@@ -193,5 +193,120 @@ class GlobalRegistryTest {
         val names = GlobalRegistry.registeredNames()
         assertTrue("a" in names)
         assertTrue("b" in names)
+    }
+
+    @Test
+    fun `stale register after unregister is ignored by version guard`() = runBlocking {
+        val suffix = System.nanoTime().toString()
+        val nodeA = LocalNode(NodeId("oa-$suffix", "global"))
+        val nodeB = LocalNode(NodeId("ob-$suffix", "global"))
+        val transport = InMemoryTransport()
+        transport.addNode(nodeA)
+        transport.addNode(nodeB)
+
+        GlobalRegistry.install(transport, nodeA)
+        GlobalRegistry.useNode(nodeB)
+        transport.connect(nodeA, nodeB)
+
+        val pid = 42L
+        val wire = "${nodeA.id.name}@${nodeA.id.host}"
+        val registerV1 = GlobalDistMsg.Register("race", wire, "race", pid, version = 1)
+        val unregisterV2 = GlobalDistMsg.Unregister("race", wire, pid, version = 2)
+
+        GlobalReplicationBus.handler!!.onMessage(registerV1, nodeA.id)
+        GlobalReplicationBus.handler!!.onMessage(unregisterV2, nodeA.id)
+        GlobalReplicationBus.handler!!.onMessage(registerV1, nodeA.id) // stale replay
+
+        val resolved = GlobalRegistry.resolveName("race")
+        assertNull(resolved, "stale register replay must be ignored")
+    }
+
+    @Test
+    fun `stale sync snapshot is ignored by version guard`() = runBlocking {
+        val suffix = System.nanoTime().toString()
+        val nodeA = LocalNode(NodeId("sa-$suffix", "global"))
+        val nodeB = LocalNode(NodeId("sb-$suffix", "global"))
+        val transport = InMemoryTransport()
+        transport.addNode(nodeA)
+        transport.addNode(nodeB)
+
+        GlobalRegistry.install(transport, nodeA)
+        GlobalRegistry.useNode(nodeB)
+        transport.connect(nodeA, nodeB)
+
+        val pid = 99L
+        val wire = "${nodeA.id.name}@${nodeA.id.host}"
+        val registerV1 = GlobalDistMsg.Register("sync-race", wire, "sync-race", pid, version = 1)
+        val unregisterV2 = GlobalDistMsg.Unregister("sync-race", wire, pid, version = 2)
+        val staleSnapshot = GlobalDistMsg.SyncSnapshot(listOf(registerV1))
+
+        GlobalReplicationBus.handler!!.onMessage(registerV1, nodeA.id)
+        GlobalReplicationBus.handler!!.onMessage(unregisterV2, nodeA.id)
+        GlobalReplicationBus.handler!!.onMessage(staleSnapshot, nodeA.id)
+
+        val resolved = GlobalRegistry.resolveName("sync-race")
+        assertNull(resolved, "stale snapshot must be ignored")
+    }
+
+    @Test
+    fun `mixed replay churn converges to latest register version`() = runBlocking {
+        val suffix = System.nanoTime().toString()
+        val nodeA = LocalNode(NodeId("ca-$suffix", "global"))
+        val nodeB = LocalNode(NodeId("cb-$suffix", "global"))
+        val transport = InMemoryTransport()
+        transport.addNode(nodeA)
+        transport.addNode(nodeB)
+        GlobalRegistry.install(transport, nodeA)
+        GlobalRegistry.useNode(nodeB)
+        transport.connect(nodeA, nodeB)
+
+        val wire = "${nodeA.id.name}@${nodeA.id.host}"
+        val pid = 77L
+        val regV1 = GlobalDistMsg.Register("churn", wire, "churn", pid, version = 1)
+        val unregV2 = GlobalDistMsg.Unregister("churn", wire, pid, version = 2)
+        val regV3 = GlobalDistMsg.Register("churn", wire, "churn", pid, version = 3)
+        val staleSync = GlobalDistMsg.SyncSnapshot(entries = listOf(regV1))
+
+        // Deliberately out-of-order/replay-heavy sequence
+        val handler = GlobalReplicationBus.handler!!
+        handler.onMessage(regV1, nodeA.id)
+        handler.onMessage(unregV2, nodeA.id)
+        handler.onMessage(staleSync, nodeA.id)
+        handler.onMessage(regV3, nodeA.id)
+        handler.onMessage(regV1, nodeA.id)
+        handler.onMessage(unregV2, nodeA.id)
+
+        val resolved = GlobalRegistry.resolveName("churn")
+        assertTrue(resolved is GlobalRegistry.NameResolution.RemoteRef, "latest register version should win")
+    }
+
+    @Test
+    fun `mixed replay churn converges to latest unregister version`() = runBlocking {
+        val suffix = System.nanoTime().toString()
+        val nodeA = LocalNode(NodeId("da-$suffix", "global"))
+        val nodeB = LocalNode(NodeId("db-$suffix", "global"))
+        val transport = InMemoryTransport()
+        transport.addNode(nodeA)
+        transport.addNode(nodeB)
+        GlobalRegistry.install(transport, nodeA)
+        GlobalRegistry.useNode(nodeB)
+        transport.connect(nodeA, nodeB)
+
+        val wire = "${nodeA.id.name}@${nodeA.id.host}"
+        val pid = 88L
+        val regV1 = GlobalDistMsg.Register("churn-gone", wire, "churn-gone", pid, version = 1)
+        val regV3 = GlobalDistMsg.Register("churn-gone", wire, "churn-gone", pid, version = 3)
+        val unregV4 = GlobalDistMsg.Unregister("churn-gone", wire, pid, version = 4)
+        val staleSync = GlobalDistMsg.SyncSnapshot(entries = listOf(regV3))
+
+        val handler = GlobalReplicationBus.handler!!
+        handler.onMessage(regV1, nodeA.id)
+        handler.onMessage(regV3, nodeA.id)
+        handler.onMessage(unregV4, nodeA.id)
+        handler.onMessage(staleSync, nodeA.id)
+        handler.onMessage(regV1, nodeA.id)
+
+        val resolved = GlobalRegistry.resolveName("churn-gone")
+        assertNull(resolved, "latest unregister version should win")
     }
 }

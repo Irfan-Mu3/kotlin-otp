@@ -32,4 +32,6 @@ include(
     "otp-dets",
     "samples:demo",
     "samples:poolboy",
+    "samples:jobs",
+    "samples:investigation",
 )

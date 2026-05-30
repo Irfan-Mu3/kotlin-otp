@@ -3,12 +3,14 @@ package org.otpstudy.genserver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -99,6 +101,42 @@ private class SlowServer : GenServer<Int> {
         return ReplyResult.Reply(state, state + 1)
     }
     override suspend fun handleCast(request: Any, state: Int) = NoreplyResult.Noreply(state)
+}
+
+private data class FairState(val controlCount: Int = 0, val castCount: Int = 0)
+
+private data object ControlTick : InfoMsg
+
+private class FairnessServer : GenServer<FairState> {
+    override suspend fun init(self: GenServerRef<FairState>) = InitResult.Ok(FairState())
+    override suspend fun handleCall(request: Any, state: FairState) = ReplyResult.Reply(state, state)
+    override suspend fun handleCast(request: Any, state: FairState): NoreplyResult<FairState> =
+        when (request) {
+            "work" -> NoreplyResult.Noreply(state.copy(castCount = state.castCount + 1))
+            else -> NoreplyResult.Noreply(state)
+        }
+
+    override suspend fun handleInfo(msg: InfoMsg, state: FairState): NoreplyResult<FairState> =
+        when (msg) {
+            ControlTick -> NoreplyResult.Noreply(state.copy(controlCount = state.controlCount + 1))
+            else -> NoreplyResult.Noreply(state)
+        }
+}
+
+private class SysHibernateServer : GenServer<Int> {
+    override suspend fun init(self: GenServerRef<Int>) = InitResult.Ok(1)
+    override suspend fun handleCall(request: Any, state: Int) = ReplyResult.Reply(state, state)
+    override suspend fun handleCast(request: Any, state: Int): NoreplyResult<Int> =
+        when (request) {
+            "hibernate" -> NoreplyResult.Hibernate(state) { msg, s ->
+                when (msg) {
+                    "wake" -> NoreplyResult.Noreply(s + 1)
+                    else -> NoreplyResult.Noreply(s)
+                }
+            }
+            "wake" -> NoreplyResult.Noreply(state + 1)
+            else -> NoreplyResult.Noreply(state)
+        }
 }
 
 class GenServerTest {
@@ -275,6 +313,42 @@ class GenServerTest {
             // Second cast should crash since buffer is full
             repeat(10) { ref.cast("overflow") }
         }
+        scope.cancel()
+    }
+
+    @Test
+    fun `finite control flood does not permanently starve user mailbox`() = runBlocking {
+        val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ref = GenServers.startLink(scope, FairnessServer(), name = "fairness-control")
+
+        repeat(5_000) { ref.sendControl(ControlTick) }
+        ref.cast("work")
+
+        withTimeout(3.seconds) {
+            while (true) {
+                val snapshot: FairState = ref.call("snapshot")
+                if (snapshot.castCount >= 1) break
+                delay(5)
+            }
+        }
+
+        scope.cancel()
+    }
+
+    @Test
+    fun `hibernate path delays sys handling until wake message`() = runBlocking {
+        val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ref = GenServers.startLink(scope, SysHibernateServer(), name = "hibernate-sys")
+
+        ref.cast("hibernate")
+        delay(50)
+        val sysGet = async { ref.sysGetState() }
+        val early = withTimeoutOrNull(150.milliseconds) { sysGet.await() }
+        assertEquals(null, early, "sys request should not complete while actor is hibernating")
+
+        ref.cast("wake")
+        val resumed = withTimeout(2.seconds) { sysGet.await() }
+        assertEquals(2, resumed)
         scope.cancel()
     }
 }
