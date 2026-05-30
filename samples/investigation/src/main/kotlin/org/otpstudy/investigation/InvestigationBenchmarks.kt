@@ -500,17 +500,18 @@ private fun runBoundedMailboxOverflow(
     val ref = GenServers.startLink(scope, EchoServer(), name = "bounded-overflow", mailboxBound = bound)
     repeat(10) { ref.call<Any>("warmup") }
 
+    // Suspend the actor (OTP sys:suspend idiom) so the mailbox fills before any drain.
+    // First `capacity` senders queue successfully; the rest get MailboxFullException
+    // immediately from trySend. sysResume fires after all senders are launched so the
+    // actor then drains and replies to the accepted callers.
+    ref.sysSuspend()
+
     val accepted = ConcurrentLinkedQueue<Long>()
     val rejectedCount = java.util.concurrent.atomic.AtomicInteger(0)
-    val readyLatch = java.util.concurrent.CountDownLatch(senders)
-    val startLatch = java.util.concurrent.CountDownLatch(1)
-
     val totalNanos = measureNanoTime {
         coroutineScope {
             repeat(senders) {
-                launch(kotlinx.coroutines.Dispatchers.IO) {
-                    readyLatch.countDown()
-                    startLatch.await()
+                async {
                     try {
                         val dt = measureNanoTime { ref.call<Any>("burst") }
                         accepted.add(dt)
@@ -519,8 +520,9 @@ private fun runBoundedMailboxOverflow(
                     }
                 }
             }
-            readyLatch.await()
-            startLatch.countDown()
+            // Brief yield so all async blocks reach trySend before the actor resumes
+            kotlinx.coroutines.delay(5)
+            ref.sysResume()
         }
     }
     ref.stop()
@@ -535,7 +537,7 @@ private fun runBoundedMailboxOverflow(
         p99Micros = p99,
         p999Micros = 0.0,
         throughputPerSec = if (totalNanos > 0) acceptedList.size * 1_000_000_000.0 / totalNanos else 0.0,
-        notes = "capacity=$capacity senders=$senders accepted=${acceptedList.size} rejected=${rejectedCount.get()} barrier=CountDownLatch",
+        notes = "capacity=$capacity senders=$senders accepted=${acceptedList.size} rejected=${rejectedCount.get()} sysSuspend barrier",
     )
 }
 

@@ -168,34 +168,47 @@ class GenServerRef<S>(
     /** Child scope tied to this server's lifecycle; useful for [OtpTimers]. */
     val timerScope: CoroutineScope get() = CoroutineScope(job)
 
+    // Completed exceptionally with ServerDownException exactly once when this server's
+    // job finishes. All in-flight calls listen to it via a select clause rather than
+    // each installing their own invokeOnCompletion handler — one allocation per actor
+    // lifetime instead of one per call.
+    // OTP source: lib/stdlib/src/gen_server.erl — do_call/4, the {'DOWN', …} receive clause.
+    private val _serverDown = CompletableDeferred<Nothing>()
+
+    init {
+        job.invokeOnCompletion { cause ->
+            _serverDown.completeExceptionally(
+                ServerDownException(id, cause ?: CancellationException("server stopped"))
+            )
+        }
+    }
+
     suspend fun <R> call(request: Any, timeout: Duration = 5.seconds): R {
-        // Capture outside withTimeout: the timeout scope's Job completes when the call returns,
-        // which would otherwise make borrower hooks (e.g. poolboy) fire immediately after checkout.
+        // Capture callerJob before suspension for borrower-monitoring hooks (e.g. poolboy).
         val callerJob = currentCoroutineContext()[Job]
+        val reply = CompletableDeferred<Any?>()
+        val msg = GenServerMsg.Call(request, reply, callerJob)
+        when (mailboxBound?.policy) {
+            OverflowPolicy.CrashSender -> {
+                if (!mailbox.trySend(msg).isSuccess)
+                    throw MailboxFullException("mailbox full for $id")
+                else queueLen.incrementAndGet()
+            }
+            // Block policy: send suspends when mailbox is full; timeout governs the reply
+            // wait below but not the send itself, which is the correct semantic for Block.
+            else -> { mailbox.send(msg); queueLen.incrementAndGet() }
+        }
+        // select races two clauses inside withTimeout:
+        //  1. reply       — normal path: actor completed the call
+        //  2. _serverDown — server died before replying (throws ServerDownException)
+        // withTimeout provides the deadline; if it fires, the select is cancelled and
+        // TimeoutCancellationException propagates to the caller.
+        // Per-actor _serverDown avoids per-call invokeOnCompletion install/dispose.
+        @Suppress("UNCHECKED_CAST")
         return withTimeout(timeout) {
-            val reply = CompletableDeferred<Any?>()
-            val msg = GenServerMsg.Call(request, reply, callerJob)
-            when (mailboxBound?.policy) {
-                OverflowPolicy.CrashSender -> {
-                    if (!mailbox.trySend(msg).isSuccess)
-                        throw MailboxFullException("mailbox full for $id")
-                    else queueLen.incrementAndGet()
-                }
-                else -> { mailbox.send(msg); queueLen.incrementAndGet() }
-            }
-            // If the server job dies while we wait, complete reply with ServerDownException
-            // rather than hanging until the call timeout expires.
-            // OTP source: lib/stdlib/src/gen_server.erl — do_call/4, the {'DOWN',...} clause
-            val deathWatch = job.invokeOnCompletion { cause ->
-                reply.completeExceptionally(
-                    ServerDownException(id, cause ?: CancellationException("server stopped"))
-                )
-            }
-            try {
-                @Suppress("UNCHECKED_CAST")
-                reply.await() as R
-            } finally {
-                deathWatch.dispose()
+            select {
+                reply.onAwait { it as R }
+                _serverDown.onAwait { error("unreachable") }  // always throws ServerDownException
             }
         }
     }
@@ -292,11 +305,22 @@ class GenServerRef<S>(
 }
 
 object GenServers {
-    // Used internally to discriminate select-branch results in the run loop
-    private sealed class LoopMsg {
-        data class User(val msg: GenServerMsg) : LoopMsg()
-        data object SysHandled : LoopMsg()
-        data object ChannelClosed : LoopMsg()
+    // Discriminates run-loop receive outcomes without boxing a wrapper object.
+    // At the JVM level an unboxed LoopMsg *is* the underlying Any? reference —
+    // LoopMsg.user(msg) compiles to a no-op; only sentinel comparisons add cost.
+    @JvmInline
+    private value class LoopMsg private constructor(private val raw: Any?) {
+        val isSysHandled: Boolean   get() = raw === SYS_HANDLED
+        val isChannelClosed: Boolean get() = raw === CHANNEL_CLOSED
+        fun asUserMsg(): GenServerMsg = raw as GenServerMsg
+
+        companion object {
+            private val SYS_HANDLED   = Any()
+            private val CHANNEL_CLOSED = Any()
+            val SysHandled    = LoopMsg(SYS_HANDLED)
+            val ChannelClosed = LoopMsg(CHANNEL_CLOSED)
+            fun user(msg: GenServerMsg) = LoopMsg(msg)
+        }
     }
 
     fun <S> startLink(
@@ -603,6 +627,8 @@ object GenServers {
                 //    This ensures sys messages are always processed even when the mailbox is idle.
                 //    When hibernateAfter is set, the select times out and re-enters: analogous to
                 //    OTP's gen_server hibernate_after timer (erlang:hibernate/3 after idle period).
+                // Full select: races sysMailbox and mailbox. Used when a sys message may
+                // be pending or when hibernateAfter requires a timeout.
                 suspend fun awaitMsg(): LoopMsg = select {
                     sysMailbox.onReceiveCatching { r ->
                         val sys = r.getOrNull() ?: return@onReceiveCatching LoopMsg.ChannelClosed
@@ -612,7 +638,7 @@ object GenServers {
                     if (!suspended) {
                         mailbox.onReceiveCatching { r ->
                             val msg = r.getOrNull() ?: return@onReceiveCatching LoopMsg.ChannelClosed
-                            LoopMsg.User(msg)
+                            LoopMsg.user(msg)
                         }
                     }
                 }
@@ -624,12 +650,11 @@ object GenServers {
                     awaitMsg()
                 }
 
-                when (loopMsg) {
-                    LoopMsg.SysHandled -> continue@outer
-                    LoopMsg.ChannelClosed -> break@outer
-                    is LoopMsg.User -> { /* fall through to process msg below */ }
+                when {
+                    loopMsg.isSysHandled  -> continue@outer
+                    loopMsg.isChannelClosed -> break@outer
                 }
-                val msg = (loopMsg as LoopMsg.User).msg
+                val msg = loopMsg.asUserMsg()
                 queueLen.decrementAndGet()
 
                 // 4. Process user message

@@ -85,15 +85,20 @@ fun Double.pretty(): String = "%.2f".format(this)
 // OTP escript runner (optional — pass --otp flag)
 // ---------------------------------------------------------------------------
 
-/** Invokes the Erlang escript and parses its CSV output into BenchResult rows. */
-fun runOtpBenchmark(scriptPath: String): List<BenchResult> {
+/**
+ * Invokes the Erlang escript for exactly one round with the given profile,
+ * and returns the parsed BenchResult rows for that round.
+ */
+fun runOtpBenchmark(scriptPath: String, profile: BenchProfile): List<BenchResult> {
     val escript = resolveEscriptPath()
     if (escript == null) {
         System.err.println("[otp] escript not found on PATH — skipping OTP benchmarks")
         return emptyList()
     }
+    // Run a single round at the matching profile so callers/iterations stay in sync
+    val profileArg = "--profile=${profile.name}"
     return try {
-        val proc = ProcessBuilder(escript, scriptPath)
+        val proc = ProcessBuilder(escript, scriptPath, profileArg, "--rounds=1")
             .redirectErrorStream(true)
             .start()
         val output = proc.inputStream.bufferedReader().readText()
@@ -203,7 +208,7 @@ fun main(args: Array<String>) {
         // --- OTP via escript (optional) ---
         if (profile.runOtp) {
             if (escriptFile != null) {
-                roundResults += runOtpBenchmark(escriptFile.absolutePath)
+                roundResults += runOtpBenchmark(escriptFile.absolutePath, profile)
             } else {
                 System.err.println("[otp] escript file not found — skipping OTP benchmarks")
             }
