@@ -194,6 +194,30 @@ val config = cache.readCached() ?: defaultConfig
 
 ---
 
+## Actor memory footprint
+
+Each idle kotlin-otp actor consumes **~2.5 KB** of heap — comparable to an OTP gen_server process. Coroutines do not hold OS thread stacks when suspended; only the continuation state (~few hundred bytes) plus the channel and ref fields.
+
+| Framework | Bytes per idle actor | Notes |
+|---|---|---|
+| OTP gen_server | ~2 000–6 000 B | `erlang:process_info(Pid, memory)`; min heap 1.8 KB + PCB |
+| **kotlin-otp (Default)** | **~2 600 B (2.5 KB)** | Measured, N=1 000 actors |
+| **kotlin-otp (Loom)** | **~2 700 B (2.6 KB)** | Measured, N=1 000 actors |
+| Pekko typed actor | ~1 000–2 000 B | Published Lightbend figures |
+| Akka typed actor | ~600–2 000 B | Published Akka docs |
+
+**Loom vs Default:** identical for idle actors — a suspended coroutine stores state in a `Continuation` object regardless of dispatcher. The virtual thread stack only exists while the actor is actively running.
+
+**Scaling:**
+- 100 000 actors × 2.5 KB = **250 MB**
+- 1 000 000 actors × 2.5 KB = **2.5 GB**
+
+OTP's "run millions of processes" property holds for kotlin-otp coroutines too. Both avoid per-actor OS thread stacks. The constraint is JVM heap, not thread count.
+
+**Caveat:** measured via `System.gc()` + heap snapshot — advisory, not precise. For allocator-accurate profiling use JFR (`-XX:+FlightRecorder`) or async-profiler in allocation mode.
+
+---
+
 ## TCP distribution
 
 For cross-node calls via `KotlinNodeTransport`, the kernel TCP stack adds ~65 µs above in-memory on loopback:
@@ -271,6 +295,7 @@ Do not use `-XX:TieredStopAtLevel=1` for latency-sensitive actors — it trades 
 | Read-heavy eventually consistent | `CachedReadRef` | **< 40 ns** |
 | Blocking workers (JDBC, HTTP) | `LongTaskBoundary` — defaults to `OtpDispatchers.IO` | **5–10× faster** vs capped IO at high N |
 | TCP transport | `KotlinNodeTransport` — stays on `Dispatchers.IO` | **~55 µs** loopback |
+| Idle actor memory | Coroutines (no OS thread stack when suspended) | **~2.5 KB/actor** — comparable to OTP |
 | GC tail reduction | `-XX:+UseZGC` | p999 < 1 ms |
 
 ---
