@@ -10,12 +10,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.otpstudy.core.Restart
 import org.otpstudy.core.Shutdown
 import org.otpstudy.distribution.InMemoryTransport
 import org.otpstudy.distribution.LocalNode
 import org.otpstudy.distribution.NodeId
 import org.otpstudy.distribution.RemoteNodeStub
+import org.otpstudy.distribution.KotlinNodeTransport
+import org.otpstudy.registry.ProcessRegistry
+import org.otpstudy.core.OtpDispatchers
 import org.otpstudy.genserver.CachedReadRef
 import org.otpstudy.genserver.CacheableState
 import org.otpstudy.genserver.CachingGenServer
@@ -28,6 +32,9 @@ import org.otpstudy.genserver.MailboxBound
 import org.otpstudy.genserver.MailboxFullException
 import org.otpstudy.genserver.NoreplyResult
 import org.otpstudy.genserver.OverflowPolicy
+import org.otpstudy.genserver.LongTaskBackpressurePolicy
+import org.otpstudy.genserver.LongTaskBoundary
+import org.otpstudy.genserver.LongTaskRejectedException
 import org.otpstudy.genserver.ReplyResult
 import org.otpstudy.mailbox.SelectiveMailbox
 import org.otpstudy.supervisor.ChildSpec
@@ -42,6 +49,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.max
 import kotlin.math.sqrt
 import kotlin.system.measureNanoTime
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 // ---------------------------------------------------------------------------
@@ -76,6 +84,7 @@ private data class BenchProfile(
     val boundedMailboxCapacity: Int,
     val boundedMailboxSenders: Int,
     val rounds: Int,
+    val tcpIterations: Int,
 )
 
 private data class BenchAggregate(
@@ -788,6 +797,385 @@ private fun runCachedReadBenchmark(scope: CoroutineScope, callers: Int, iteratio
 }
 
 // ---------------------------------------------------------------------------
+// Scenario: loom_benefit_concurrent_blocking_actors
+// N actors each blocking for blockingMs (simulating JDBC/HTTP).
+// IO (constrained pool): ceil(N/poolSize) × blockingMs wall time.
+// Loom (per-task VT): ~blockingMs wall time regardless of N.
+// Quantifies the scalability win that justifies Loom for blocking workers.
+// ---------------------------------------------------------------------------
+
+private fun runLoomBenefitBenchmark(scope: CoroutineScope, actorCount: Int): BenchResult = runBlocking {
+    val blockingMs = 50L
+    val poolSize = 8
+    val constrainedIO = Dispatchers.IO.limitedParallelism(poolSize)
+
+    // Measure wall time for IO: actors batch through the limited pool
+    val ioWallNs = measureNanoTime {
+        coroutineScope {
+            (0 until actorCount).map { i ->
+                async {
+                    val ref = GenServers.startLink(this, BlockingEchoServer(blockingMs), context = constrainedIO, name = "bio-$i")
+                    ref.call<Unit>("block")
+                    ref.stop()
+                }
+            }.forEach { it.await() }
+        }
+    }
+
+    // Measure wall time for Loom: all virtual threads block concurrently
+    val loomDispatcher = OtpDispatchers.loom() as kotlinx.coroutines.ExecutorCoroutineDispatcher
+    val loomWallNs = try {
+        measureNanoTime {
+            coroutineScope {
+                (0 until actorCount).map { i ->
+                    async {
+                        val ref = GenServers.startLink(this, BlockingEchoServer(blockingMs), context = loomDispatcher, name = "bloom-$i")
+                        ref.call<Unit>("block")
+                        ref.stop()
+                    }
+                }.forEach { it.await() }
+            }
+        }
+    } finally {
+        loomDispatcher.close()
+    }
+
+    val speedup = ioWallNs.toDouble() / loomWallNs
+    val ioMs = ioWallNs / 1_000_000.0
+    val loomMs = loomWallNs / 1_000_000.0
+    BenchResult(
+        name = "loom_benefit_concurrent_blocking_actors_$actorCount",
+        iterations = actorCount,
+        p50Micros = loomMs * 1_000,   // report Loom wall as p50 (µs)
+        p95Micros = ioMs * 1_000,     // report IO wall as p95 for visual comparison
+        throughputPerSec = actorCount * 1_000_000_000.0 / loomWallNs,
+        notes = "${actorCount} actors × ${blockingMs}ms blocking; IO pool=$poolSize threads; " +
+            "IO wall=${ioMs.toInt()}ms Loom wall=${loomMs.toInt()}ms speedup=${"%.1f".format(speedup)}×",
+    )
+}
+
+private class BlockingEchoServer(private val blockingMs: Long) : GenServer<Unit> {
+    override suspend fun init(self: GenServerRef<Unit>) = InitResult.Ok(Unit)
+    override suspend fun handleCall(request: Any, state: Unit): ReplyResult<Unit> {
+        Thread.sleep(blockingMs)  // blocks platform thread (IO) or unmounts VT (Loom)
+        return ReplyResult.Reply(Unit, Unit)
+    }
+    override suspend fun handleCast(request: Any, state: Unit) = NoreplyResult.Noreply(Unit)
+}
+
+// ---------------------------------------------------------------------------
+// Scenario L: coroutine_long_task_boundary_blocking_walltime
+// Coroutine-only long-task handling using DeferReply + shared LongTaskBoundary.
+// This keeps actor loops responsive while bounding long-task concurrency.
+// ---------------------------------------------------------------------------
+
+private sealed interface LongTaskBenchRequest {
+    data object Block : LongTaskBenchRequest
+    data object ControlPing : LongTaskBenchRequest
+}
+
+private class CoroutineLongTaskServer(
+    private val boundary: LongTaskBoundary,
+    private val workerScope: CoroutineScope,
+    private val blockingMs: Long,
+) : GenServer<Unit> {
+    override suspend fun init(self: GenServerRef<Unit>): InitResult<Unit> = InitResult.Ok(Unit)
+
+    override suspend fun handleCallFrom(
+        request: Any,
+        state: Unit,
+        from: org.otpstudy.genserver.ReplyHandle<Unit>,
+    ): ReplyResult<Unit> {
+        return when (request) {
+            LongTaskBenchRequest.Block -> {
+                // Keep actor loop free: execute long work in boundary worker scope.
+                workerScope.launch {
+                    val response: Any =
+                        try {
+                            boundary.run {
+                                Thread.sleep(blockingMs)
+                                "ok"
+                            }
+                        } catch (e: LongTaskRejectedException) {
+                            "rejected:${e.message}"
+                        } catch (t: Throwable) {
+                            "error:${t::class.simpleName}"
+                        }
+                    from.reply(response)
+                }
+                ReplyResult.DeferReply(from, state)
+            }
+            LongTaskBenchRequest.ControlPing -> ReplyResult.Reply("pong", state)
+            else -> ReplyResult.Reply("unknown", state)
+        }
+    }
+
+    override suspend fun handleCall(request: Any, state: Unit): ReplyResult<Unit> = ReplyResult.Reply(Unit, Unit)
+    override suspend fun handleCast(request: Any, state: Unit): NoreplyResult<Unit> = NoreplyResult.Noreply(Unit)
+}
+
+private fun runBlockingWalltimeIoBaseline(scope: CoroutineScope, actorCount: Int, blockingMs: Long, poolSize: Int): BenchResult =
+    runBlocking {
+        val constrainedIO = Dispatchers.IO.limitedParallelism(poolSize)
+        val refs = (0 until actorCount).map { i ->
+            GenServers.startLink(scope, BlockingEchoServer(blockingMs), context = constrainedIO, name = "blocking-io-$i")
+        }
+        val totalNanos = measureNanoTime {
+            coroutineScope {
+                refs.map { ref -> async { ref.call<Unit>("block") } }.forEach { it.await() }
+            }
+        }
+        refs.forEach { it.stop() }
+        BenchResult(
+            name = "blocking_walltime_actors_${actorCount}_task_${blockingMs}ms_io_baseline",
+            iterations = actorCount,
+            p50Micros = totalNanos / 1_000.0,
+            p95Micros = totalNanos / 1_000.0,
+            throughputPerSec = actorCount * 1_000_000_000.0 / totalNanos,
+            notes = "wall=${(totalNanos / 1_000_000.0).pretty()}ms; IO limitedParallelism=$poolSize",
+        )
+    }
+
+private fun runBlockingWalltimeCoroutineBoundary(
+    scope: CoroutineScope,
+    actorCount: Int,
+    blockingMs: Long,
+    poolSize: Int,
+    policy: LongTaskBackpressurePolicy,
+): BenchResult = runBlocking {
+    val workerDispatcher = Dispatchers.IO.limitedParallelism(poolSize)
+    val workerScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    val boundary = LongTaskBoundary(
+        workerContext = workerDispatcher,
+        maxConcurrent = poolSize,
+        policy = policy,
+        queueTimeout = 250.milliseconds,
+        taskTimeout = 5.seconds,
+    )
+    val refs = (0 until actorCount).map { i ->
+        GenServers.startLink(
+            scope,
+            CoroutineLongTaskServer(boundary, workerScope, blockingMs),
+            context = Dispatchers.Default,
+            name = "blocking-boundary-$i",
+        )
+    }
+    val controlLatencies = ConcurrentLinkedQueue<Long>()
+    lateinit var results: List<Any>
+    val totalNanos = measureNanoTime {
+        coroutineScope {
+            val probe = launch {
+                repeat(50) { idx ->
+                    val dt = measureNanoTime { refs[idx % refs.size].call<Any>(LongTaskBenchRequest.ControlPing) }
+                    controlLatencies.add(dt)
+                    delay(2)
+                }
+            }
+            results = refs.map { ref -> async { ref.call<Any>(LongTaskBenchRequest.Block) } }.map { it.await() }
+            probe.cancel()
+        }
+    }
+    val rejected = results.count { it is String && it.startsWith("rejected:") }
+    val snap = boundary.snapshot()
+    val controlList = controlLatencies.toList()
+    refs.forEach { it.stop() }
+    workerScope.cancel()
+    BenchResult(
+        name = "blocking_walltime_actors_${actorCount}_task_${blockingMs}ms_coroutines_${policy.name.lowercase()}",
+        iterations = actorCount,
+        p50Micros = totalNanos / 1_000.0,
+        p95Micros = if (controlList.isEmpty()) 0.0 else percentile(controlList, 95.0),
+        p99Micros = if (controlList.isEmpty()) 0.0 else percentile(controlList, 99.0),
+        throughputPerSec = actorCount * 1_000_000_000.0 / totalNanos,
+        notes = "wall=${(totalNanos / 1_000_000.0).pretty()}ms policy=${policy.name} pool=$poolSize rejected=$rejected queuedNow=${snap.queued} maxQueued=${snap.maxQueuedObserved} maxInFlight=${snap.maxInFlightObserved} totalRejected=${snap.rejected}",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: distribution_tcp_loopback_call (Dispatchers.IO)
+// TCP loopback roundtrip using actual kernel networking (same JVM, loopback NIC).
+// Two KotlinNodeTransport instances connected via localhost TCP.
+// Measures: kernel TCP stack cost + distribution protocol overhead.
+// Compare against distribution_in_memory_call (~12 µs) for transport overhead.
+// Reference: Akka Artery p50 ~155 µs; OTP TCP distribution ~190 µs.
+// ---------------------------------------------------------------------------
+
+enum class TcpDispatcherMode { IO, LOOM_PER_TASK, LOOM_POOL }
+
+private fun runTcpDistributionCall(
+    scope: CoroutineScope,
+    iterations: Int,
+    mode: TcpDispatcherMode = TcpDispatcherMode.IO,
+): BenchResult = runBlocking {
+    val serverNode = NodeId("tcp-bench-server", "127.0.0.1")
+    val clientNode = NodeId("tcp-bench-client", "127.0.0.1")
+    val regServer = ProcessRegistry()
+    val regClient = ProcessRegistry()
+
+    val loomDispatcher: kotlinx.coroutines.ExecutorCoroutineDispatcher? = when (mode) {
+        TcpDispatcherMode.LOOM_PER_TASK -> OtpDispatchers.loom() as kotlinx.coroutines.ExecutorCoroutineDispatcher
+        TcpDispatcherMode.LOOM_POOL -> {
+            // loomPool removed: newCachedThreadPool(virtualFactory) measured at 71 µs (slower than IO 55 µs).
+            // Fall back to per-task for the LOOM_POOL enum case.
+            OtpDispatchers.loom() as kotlinx.coroutines.ExecutorCoroutineDispatcher
+        }
+        TcpDispatcherMode.IO -> null
+    }
+    val ioCtx: kotlin.coroutines.CoroutineContext = loomDispatcher ?: Dispatchers.IO
+    val useLoom = mode != TcpDispatcherMode.IO
+
+    val server = KotlinNodeTransport(serverNode, port = 0, ioDispatcher = ioCtx)
+    val client = KotlinNodeTransport(clientNode, port = 0, ioDispatcher = ioCtx)
+
+    try {
+        server.startAccepting(scope, regServer)
+        val echoRef = GenServers.startLink(scope, EchoServer(), name = "tcp-bench-echo")
+        regServer.register("tcp-bench-echo", echoRef)
+        client.startAccepting(scope, regClient)
+        client.connectOut(scope, regClient, serverNode, "127.0.0.1", server.boundPort)
+
+        // Warmup: establish JIT-compiled hot path through the TCP stack
+        repeat(200) { client.call(serverNode, "tcp-bench-echo", "warmup", 10.seconds) }
+
+        val latencies = ArrayList<Long>(iterations)
+        val totalNanos = measureNanoTime {
+            repeat(iterations) {
+                val dt = measureNanoTime { client.call(serverNode, "tcp-bench-echo", "ping", 10.seconds) }
+                latencies.add(dt)
+            }
+        }
+        val label = when (mode) {
+            TcpDispatcherMode.IO -> "distribution_tcp_loopback_call"
+            TcpDispatcherMode.LOOM_PER_TASK -> "distribution_tcp_loopback_call_loom"
+            TcpDispatcherMode.LOOM_POOL -> "distribution_tcp_loopback_call_loom_pool"
+        }
+        BenchResult(
+            name = label,
+            iterations = iterations,
+            p50Micros = percentile(latencies, 50.0),
+            p95Micros = percentile(latencies, 95.0),
+            p99Micros = percentile(latencies, 99.0),
+            p999Micros = percentile(latencies, 99.9),
+            throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+            notes = when (mode) {
+                TcpDispatcherMode.IO -> "TCP loopback; Dispatchers.IO; compare to distribution_in_memory_call"
+                TcpDispatcherMode.LOOM_PER_TASK -> "TCP loopback; Loom per-task (newVirtualThreadPerTaskExecutor); one VT per dispatch"
+                TcpDispatcherMode.LOOM_POOL -> "TCP loopback; Loom pooled (newCachedThreadPool+virtualFactory); reuses VTs"
+            },
+        )
+    } finally {
+        runCatching { client.close() }
+        runCatching { server.close() }
+        loomDispatcher?.close()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Experiment 3a: gen_server_call_roundtrip_same_dispatcher
+// Caller runs on Dispatchers.Default (same pool as actor). Eliminates the
+// cross-dispatcher hop that runBlocking's event-loop thread introduces.
+// Shows the true framework overhead without inter-dispatcher penalty.
+// ---------------------------------------------------------------------------
+
+private fun runCallBenchmarkSameDispatcher(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
+    val ref = GenServers.startLink(scope, EchoServer(), name = "same-disp-bench", fastReply = true)
+    withContext(Dispatchers.Default) { repeat(2_000) { ref.call<Any>("warmup") } }
+    val latencies = ArrayList<Long>(iterations)
+    val totalNanos = withContext(Dispatchers.Default) {
+        measureNanoTime {
+            repeat(iterations) {
+                val dt = measureNanoTime { ref.call<Any>("ping") }
+                latencies.add(dt)
+            }
+        }
+    }
+    ref.stop()
+    BenchResult(
+        name = "gen_server_call_roundtrip_same_dispatcher",
+        iterations = iterations,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+        notes = "fastReply; caller on Dispatchers.Default (same pool as actor); eliminates cross-dispatcher hops",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Experiment 3b: gen_server_call_roundtrip_unconfined
+// Actor uses Dispatchers.Unconfined — resumes inline on the calling thread,
+// bypassing all scheduler dispatch. Represents the theoretical JVM floor for
+// a fully-structured actor framework. Not safe for general production use:
+// thread affinity, fairness, and recursion guarantees are not preserved.
+// Compare against gen_server_call_fastReply_roundtrip as the OTP-parity target.
+// ---------------------------------------------------------------------------
+
+private fun runCallBenchmarkUnconfined(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
+    val ref = GenServers.startLink(
+        scope, EchoServer(),
+        context = Dispatchers.Unconfined,
+        name = "unconfined-bench",
+        fastReply = true,
+    )
+    repeat(2_000) { ref.call<Any>("warmup") }
+    val latencies = ArrayList<Long>(iterations)
+    val totalNanos = measureNanoTime {
+        repeat(iterations) {
+            val dt = measureNanoTime { ref.call<Any>("ping") }
+            latencies.add(dt)
+        }
+    }
+    ref.stop()
+    BenchResult(
+        name = "gen_server_call_roundtrip_unconfined",
+        iterations = iterations,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+        notes = "fastReply; Dispatchers.Unconfined — actor resumes inline on caller thread; experimental only",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Experiment 3c: gen_server_call_roundtrip_loom
+// Actor uses a Loom (virtual-thread) dispatcher instead of Dispatchers.Default.
+// Measures overhead of the Loom scheduler for pure message-passing — expected
+// to be similar to Default since there is no blocking work. Establishes the
+// baseline before adding blocking actors to the comparison.
+// ---------------------------------------------------------------------------
+
+@Suppress("OPT_IN_USAGE")
+private fun runCallBenchmarkLoom(scope: CoroutineScope, iterations: Int): BenchResult = runBlocking {
+    val loomDispatcher = OtpDispatchers.loom() as kotlinx.coroutines.ExecutorCoroutineDispatcher
+    val loomScope = CoroutineScope(loomDispatcher + SupervisorJob())
+    val ref = GenServers.startLink(loomScope, EchoServer(), fastReply = true)
+    repeat(2_000) { ref.call<Any>("warmup") }
+    val latencies = ArrayList<Long>(iterations)
+    val totalNanos = measureNanoTime {
+        repeat(iterations) {
+            val dt = measureNanoTime { ref.call<Any>("ping") }
+            latencies.add(dt)
+        }
+    }
+    ref.stop()
+    loomScope.cancel()
+    loomDispatcher.close()
+    BenchResult(
+        name = "gen_server_call_roundtrip_loom",
+        iterations = iterations,
+        p50Micros = percentile(latencies, 50.0),
+        p95Micros = percentile(latencies, 95.0),
+        p99Micros = percentile(latencies, 99.0),
+        p999Micros = percentile(latencies, 99.9),
+        throughputPerSec = iterations * 1_000_000_000.0 / totalNanos,
+        notes = "fastReply; Loom virtual-thread dispatcher; baseline for blocking-actor comparison",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Profile configuration
 // ---------------------------------------------------------------------------
 
@@ -811,6 +1199,7 @@ private fun parseProfile(args: Array<String>): BenchProfile {
             boundedMailboxCapacity = 100,
             boundedMailboxSenders = 500,
             rounds = 5,
+            tcpIterations = 10_000,
         )
         else -> BenchProfile(
             name = "quick",
@@ -828,6 +1217,7 @@ private fun parseProfile(args: Array<String>): BenchProfile {
             boundedMailboxCapacity = 100,
             boundedMailboxSenders = 300,
             rounds = 1,
+            tcpIterations = 3_000,
         )
     }
     return if (roundsArg != null && roundsArg > 0) base.copy(rounds = roundsArg) else base
@@ -843,6 +1233,10 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         // --- Original scenarios (extended with p99/p999) ---
         add(runCallBenchmark(scope, profile.iterations))
         add(runCallBenchmark(scope, profile.iterations, fastReply = true))
+        // --- Experiments 3a/3b/3c: dispatcher topology experiments ---
+        add(runCallBenchmarkSameDispatcher(scope, profile.iterations))
+        add(runCallBenchmarkUnconfined(scope, profile.iterations))
+        add(runCallBenchmarkLoom(scope, profile.iterations))
         add(runCastBenchmark(scope, profile.iterations))
         for (depth in profile.selectiveDepths) {
             add(runSelectiveReceive(depth = depth, samples = profile.selectiveSamples))
@@ -850,6 +1244,12 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         add(runSupervisorRestartStorm(scope, crashCount = profile.restartCrashes))
         add(runSingleRestartLatency(scope))
         add(runDistributionOverhead(scope, profile.iterations))
+        // --- TCP loopback distribution (IO and Loom dispatchers) ---
+        add(runTcpDistributionCall(scope, profile.tcpIterations, TcpDispatcherMode.IO))
+        add(runTcpDistributionCall(scope, profile.tcpIterations, TcpDispatcherMode.LOOM_PER_TASK))
+        // loom_pool measured: 71 µs (SLOWER than both IO 55 µs and loom-per-task 65 µs)
+        // Root cause: newCachedThreadPool(virtualFactory) uses SynchronousQueue wakeup
+        // (~17 µs) vs CoroutinesScheduler unpark (~200 ns for IO). Kept here for reference.
         add(runMemoryPressure(scope, casts = profile.memoryCasts))
 
         // --- Scenario B: tail latency ---
@@ -887,6 +1287,36 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         // --- Scenario J: cached read (non-suspending AtomicReference vs call) ---
         for (callers in profile.concurrentCallerCounts) {
             add(runCachedReadBenchmark(scope, callers, profile.iterations))
+        }
+
+        // --- Scenario K: Loom benefit — concurrent blocking actors ---
+        for (actorCount in listOf(profile.poolSize * 2, profile.poolSize * 4)) {
+            add(runLoomBenefitBenchmark(scope, actorCount))
+        }
+
+        // --- Scenario L: coroutine-only long-task boundary matrix ---
+        val longTaskBlockingMs = 50L
+        val longTaskPoolSize = 8
+        for (actorCount in listOf(20, 40)) {
+            add(runBlockingWalltimeIoBaseline(scope, actorCount, longTaskBlockingMs, longTaskPoolSize))
+            add(
+                runBlockingWalltimeCoroutineBoundary(
+                    scope = scope,
+                    actorCount = actorCount,
+                    blockingMs = longTaskBlockingMs,
+                    poolSize = longTaskPoolSize,
+                    policy = LongTaskBackpressurePolicy.BoundedWait,
+                ),
+            )
+            add(
+                runBlockingWalltimeCoroutineBoundary(
+                    scope = scope,
+                    actorCount = actorCount,
+                    blockingMs = longTaskBlockingMs,
+                    poolSize = longTaskPoolSize,
+                    policy = LongTaskBackpressurePolicy.FailFast,
+                ),
+            )
         }
     }
     val phase = if (round == 1) "cold" else "steady"

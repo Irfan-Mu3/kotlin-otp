@@ -1,5 +1,6 @@
 package org.otpstudy.distribution
 
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,13 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * Length-framed JSON transport between Kotlin peers (see [THE_HADAL_ZONE.md] §2).
  *
+ * [ioDispatcher] controls the coroutine context for blocking socket operations.
+ * Defaults to [Dispatchers.IO] — the intentional exception to the "Loom first" rule.
+ * TCP frame writes (~1–3 µs blocking) are shorter than virtual-thread dispatch
+ * overhead (~4–5 µs), so the `CoroutinesScheduler`-backed IO pool is ~9 µs faster
+ * per roundtrip than `OtpDispatchers.IO`. All other blocking paths in this library
+ * default to `OtpDispatchers.IO` (Loom). Benchmark: `docs/deployment/latency-tuning.md`.
+ *
  * **Server:** [startAccepting] then [connect] from peers (or only accept inbound connections).
  * **Client:** call [startAccepting] with the same [ProcessRegistry] if you need to accept return
  * connections, or use [wire] + [connectOut] when you only dial out.
@@ -31,6 +39,7 @@ class KotlinNodeTransport(
     val localNode: NodeId,
     val clusterSecret: String = "",
     port: Int = 0,
+    private val ioDispatcher: kotlin.coroutines.CoroutineContext = Dispatchers.IO,
 ) : NodeTransport, AutoCloseable {
 
     private val json = DistributionWire.json
@@ -51,10 +60,10 @@ class KotlinNodeTransport(
 
     fun startAccepting(scope: CoroutineScope, registry: ProcessRegistry) {
         wire(scope, registry)
-        acceptJob = scope.launch(Dispatchers.IO) {
+        acceptJob = scope.launch(ioDispatcher) {
             while (!serverSocket.isClosed) {
                 val socket = runCatching { serverSocket.accept() }.getOrNull() ?: break
-                scope.launch(Dispatchers.IO) {
+                scope.launch(ioDispatcher) {
                     runCatching { acceptInbound(socket) }
                 }
             }
@@ -69,8 +78,8 @@ class KotlinNodeTransport(
         port: Int,
     ) {
         wire(scope, registry)
-        val socket = withContext(Dispatchers.IO) { Socket(host, port) }
-        val conn = KotlinDistConnection(socket, json)
+        val socket = withContext(ioDispatcher) { Socket(host, port) }
+        val conn = KotlinDistConnection(socket, json, ioDispatcher)
         val confirmed = conn.handshake(localNodeWire(), clusterSecret, initiator = true)
         check(confirmed == remoteNode) { "handshake: expected $remoteNode but got $confirmed" }
         connections[remoteNode] = conn
@@ -83,7 +92,7 @@ class KotlinNodeTransport(
 
     private suspend fun acceptInbound(socket: Socket) {
         val scope = checkNotNull(appScope) { "startAccepting before connections arrive" }
-        val conn = KotlinDistConnection(socket, json)
+        val conn = KotlinDistConnection(socket, json, ioDispatcher)
         val remoteId = conn.handshake(localNodeWire(), clusterSecret, initiator = false)
         connections[remoteId] = conn
         NodeMonitor.notifyUp(remoteId)
@@ -92,10 +101,13 @@ class KotlinNodeTransport(
     }
 
     private fun startReceiving(scope: CoroutineScope, remote: NodeId, conn: KotlinDistConnection) {
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             try {
                 while (!conn.isClosed) {
-                    val msg = conn.recv() ?: break
+                    // recvBlocking() avoids a redundant dispatcher hop: this coroutine is
+                    // already on ioDispatcher, so using conn.recv() (which calls withContext
+                    // internally) would create an unnecessary virtual thread per message.
+                    val msg = conn.recvBlocking() ?: break
                     scope.launch { dispatch(remote, conn, msg) }
                 }
             } finally {
@@ -180,6 +192,7 @@ class KotlinNodeTransport(
 internal class KotlinDistConnection(
     private val socket: Socket,
     private val json: kotlinx.serialization.json.Json,
+    private val ioDispatcher: kotlin.coroutines.CoroutineContext = Dispatchers.IO,
 ) : AutoCloseable {
     private val out = DataOutputStream(socket.getOutputStream().buffered())
     private val inp = DataInputStream(socket.getInputStream().buffered())
@@ -187,7 +200,7 @@ internal class KotlinDistConnection(
     val isClosed: Boolean get() = socket.isClosed
 
     suspend fun send(msg: DistMsg) {
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             val bytes = json.encodeToString(DistMsg.serializer(), msg).toByteArray(Charsets.UTF_8)
             synchronized(out) {
                 out.writeInt(bytes.size)
@@ -198,22 +211,32 @@ internal class KotlinDistConnection(
     }
 
     suspend fun recv(): DistMsg? =
-        withContext(Dispatchers.IO) {
-            try {
-                val len = inp.readInt()
-                if (len < 0 || len > 16 * 1024 * 1024) error("bad frame length $len")
-                val bytes = ByteArray(len)
-                inp.readFully(bytes)
-                json.decodeFromString(DistMsg.serializer(), String(bytes, Charsets.UTF_8))
-            } catch (_: EOFException) {
-                null
-            } catch (_: SocketException) {
-                null
-            }
+        withContext(ioDispatcher) { recvBlocking() }
+
+    /**
+     * Blocking (non-suspending) receive. Use from within a coroutine already
+     * dispatched to an appropriate blocking-capable context (IO or Loom virtual thread),
+     * avoiding a redundant dispatcher hop per message.
+     *
+     * With Loom: the virtual thread unmounts from its carrier during the blocking
+     * `readInt`/`readFully` calls — this is the intended usage pattern.
+     */
+    internal fun recvBlocking(): DistMsg? {
+        return try {
+            val len = inp.readInt()
+            if (len < 0 || len > 16 * 1024 * 1024) error("bad frame length $len")
+            val bytes = ByteArray(len)
+            inp.readFully(bytes)
+            json.decodeFromString(DistMsg.serializer(), String(bytes, Charsets.UTF_8))
+        } catch (_: EOFException) {
+            null
+        } catch (_: SocketException) {
+            null
         }
+    }
 
     suspend fun handshake(localWire: String, secret: String, initiator: Boolean): NodeId =
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             val myDigest = sha256Hex(secret + localWire)
             if (initiator) {
                 send(DistMsg.Hello(localWire, myDigest))
