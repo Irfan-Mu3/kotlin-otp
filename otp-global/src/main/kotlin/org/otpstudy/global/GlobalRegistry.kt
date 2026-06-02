@@ -65,9 +65,26 @@ object GlobalRegistry {
 
     var conflictResolver: ConflictResolver = ConflictResolver.KeepFirst
 
+    /**
+     * Result of a [resolveName] call — typed split between local and remote refs.
+     *
+     * ### OTP analogue
+     *
+     * `global:whereis_name/1` returns `pid() | undefined` — a flat pid with no locality
+     * information. Callers must inspect `node(Pid)` to determine if the process is local.
+     *
+     * We return [LocalRef] / [RemoteRef] instead, which is a **deliberate improvement**:
+     * the caller immediately knows whether to use a direct [GenServerRef] (in-process, zero
+     * serialisation) or a [RemoteGenServerRef] (transport hop), without an extra `node(Pid)` call.
+     * `null` (name not found) maps to OTP's `undefined`.
+     *
+     * OTP source: `lib/kernel/src/global.erl` — `whereis_name/1`, `where/1`.
+     */
     sealed class NameResolution {
+        /** Name is registered on the local node; use [ref] directly. OTP: `pid()` where `node(Pid) == node()`. */
         data class LocalRef<S>(val ref: GenServerRef<S>) : NameResolution()
 
+        /** Name is registered on a remote node; route via [stub]. OTP: `pid()` where `node(Pid) /= node()`. */
         data class RemoteRef(val stub: RemoteGenServerRef) : NameResolution()
     }
 
@@ -330,9 +347,31 @@ object GlobalRegistry {
         return if (i <= 0) NodeId(wire) else NodeId(wire.substring(0, i), wire.substring(i + 1))
     }
 
+    /**
+     * Result of a [registerName] call.
+     *
+     * ### OTP analogue
+     *
+     * `global:register_name/2,3` returns `yes | no` — a flat atom with no detail:
+     * - `yes` → registration succeeded
+     * - `no` → name was already taken (conflict or dup-name check failed)
+     *
+     * We return [Ok] / [Conflict] instead, which is a **deliberate improvement**:
+     * [Conflict] carries the existing [GenServerRef] so callers can inspect the incumbent
+     * before deciding to retry, yield, or escalate — without a separate `whereis_name` call.
+     *
+     * `global:re_register_name/3` (always-win variant) maps to using [ConflictResolver.KeepLast].
+     *
+     * OTP source: `lib/kernel/src/global.erl` — `register_name/3`.
+     */
     sealed class RegisterResult {
+        /** Name was registered successfully. OTP: `yes`. */
         data object Ok : RegisterResult()
 
+        /**
+         * Name was already registered by [existing]. OTP: `no`.
+         * Unlike OTP, includes the conflicting ref for zero-extra-round-trip inspection.
+         */
         data class Conflict(val existing: GenServerRef<*>) : RegisterResult()
     }
 
