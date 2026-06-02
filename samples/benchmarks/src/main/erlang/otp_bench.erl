@@ -309,7 +309,36 @@ run_round(Round, Iterations, Warmup, CallerCounts) ->
         end,
         CallerCounts),
 
+    %% 5. Memory footprint
+    run_memory_footprint(100, Round),
+    run_memory_footprint(1000, Round),
+
     Round.  %% satisfy foreach — the value is discarded
+
+%% ---------------------------------------------------------------------------
+%% Memory footprint: create N idle gen_server processes, measure heap per process.
+%% Uses erlang:process_info(Pid, memory) which returns words used by heap + stack + PCB.
+%% ---------------------------------------------------------------------------
+
+run_memory_footprint(N, Round) ->
+    erlang:garbage_collect(),
+    Pids = [begin {ok, Pid} = gen_server:start_link(?MODULE, [], []), Pid end
+            || _ <- lists:seq(1, N)],
+    erlang:garbage_collect(),
+    Memories = [element(2, erlang:process_info(Pid, memory)) || Pid <- Pids],
+    AvgBytes = lists:sum(Memories) div length(Memories),
+    MinBytes = lists:min(Memories),
+    MaxBytes = lists:max(Memories),
+    lists:foreach(fun(Pid) -> gen_server:stop(Pid) end, Pids),
+    Label = "otp_idle_process_memory_" ++ integer_to_list(N),
+    io:format("~w,otp,~s,~w,~w,~w,~w,~w,~w,~s~n", [
+        Round, Label, N,
+        AvgBytes, MinBytes, MaxBytes, MaxBytes,
+        N,
+        "bytes per idle gen_server; erlang:process_info(Pid,memory) avg=" ++
+            integer_to_list(AvgBytes) ++ "B min=" ++ integer_to_list(MinBytes) ++
+            "B max=" ++ integer_to_list(MaxBytes) ++ "B"
+    ]).
 
 %% ---------------------------------------------------------------------------
 %% Profile parsing

@@ -120,6 +120,19 @@ private suspend fun <W> PoolRef<W>.awaitStatus(
     return status()
 }
 
+private suspend fun <W> CoroutineScope.withPool(
+    config: PoolConfig,
+    factory: WorkerFactory<W>,
+    block: suspend (PoolRef<W>) -> Unit,
+) {
+    val pool = Poolboy.startLink(this, config, factory)
+    try {
+        block(pool)
+    } finally {
+        pool.stop()
+    }
+}
+
 @Timeout(value = 60, unit = TimeUnit.SECONDS)
 class PoolboyTest {
     @AfterEach
@@ -154,19 +167,15 @@ class PoolboyTest {
     @Test
     fun pool_startup_size() =
         runBlocking {
-            val pool = Poolboy.startLink(this, PoolConfig(size = 5, maxOverflow = 0), testFactory())
-            try {
+            withPool(PoolConfig(size = 5, maxOverflow = 0), testFactory()) { pool ->
                 assertEquals(PoolStatus(PoolStateName.Ready, 5, 0, 0), pool.status())
-            } finally {
-                pool.stop()
             }
         }
 
     @Test
     fun checkout_returns_distinct_workers() =
         runBlocking {
-            val pool = Poolboy.startLink(this, PoolConfig(size = 3, maxOverflow = 0), testFactory())
-            try {
+            withPool(PoolConfig(size = 3, maxOverflow = 0), testFactory()) { pool ->
                 val w1 = pool.checkout()!!
                 val w2 = pool.checkout()!!
                 val w3 = pool.checkout()!!
@@ -184,21 +193,16 @@ class PoolboyTest {
                 assertTrue(pending.isActive)
                 pool.checkin(w1)
                 pending.join()
-            } finally {
-                pool.stop()
             }
         }
 
     @Test
     fun lifo_strategy() =
         runBlocking {
-            val pool =
-                Poolboy.startLink(
-                    this,
-                    PoolConfig(size = 3, maxOverflow = 0, strategy = PoolConfig.Strategy.Lifo),
-                    testFactory(),
-                )
-            try {
+            withPool(
+                PoolConfig(size = 3, maxOverflow = 0, strategy = PoolConfig.Strategy.Lifo),
+                testFactory(),
+            ) { pool ->
                 val w1 = pool.checkout()!!
                 val w2 = pool.checkout()!!
                 val w3 = pool.checkout()!!
@@ -209,21 +213,16 @@ class PoolboyTest {
                 assertEquals(w3.localRef(), pool.checkout()!!.localRef())
                 assertEquals(w2.localRef(), pool.checkout()!!.localRef())
                 assertEquals(w1.localRef(), pool.checkout()!!.localRef())
-            } finally {
-                pool.stop()
             }
         }
 
     @Test
     fun fifo_strategy() =
         runBlocking {
-            val pool =
-                Poolboy.startLink(
-                    this,
-                    PoolConfig(size = 3, maxOverflow = 0, strategy = PoolConfig.Strategy.Fifo),
-                    testFactory(),
-                )
-            try {
+            withPool(
+                PoolConfig(size = 3, maxOverflow = 0, strategy = PoolConfig.Strategy.Fifo),
+                testFactory(),
+            ) { pool ->
                 val w1 = pool.checkout()!!
                 val w2 = pool.checkout()!!
                 val w3 = pool.checkout()!!
@@ -234,8 +233,6 @@ class PoolboyTest {
                 assertEquals(w1.localRef(), pool.checkout()!!.localRef())
                 assertEquals(w2.localRef(), pool.checkout()!!.localRef())
                 assertEquals(w3.localRef(), pool.checkout()!!.localRef())
-            } finally {
-                pool.stop()
             }
         }
 

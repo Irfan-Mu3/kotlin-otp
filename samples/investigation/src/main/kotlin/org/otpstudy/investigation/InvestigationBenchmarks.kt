@@ -85,6 +85,7 @@ private data class BenchProfile(
     val boundedMailboxSenders: Int,
     val rounds: Int,
     val tcpIterations: Int,
+    val memoryActorCounts: List<Int>,
 )
 
 private data class BenchAggregate(
@@ -1176,6 +1177,64 @@ private fun runCallBenchmarkLoom(scope: CoroutineScope, iterations: Int): BenchR
 }
 
 // ---------------------------------------------------------------------------
+// Memory helpers
+// ---------------------------------------------------------------------------
+
+/** Trigger GC and return used heap bytes. */
+private fun stableHeap(): Long {
+    repeat(3) { System.gc(); Thread.sleep(60) }
+    return Runtime.getRuntime().let { it.totalMemory() - it.freeMemory() }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: actor_memory_footprint
+// N idle actors created, stable-GC heap measured before and after.
+// Reports bytes per actor — the per-actor memory cost of the framework.
+// Reference: OTP gen_server idle process ~2–8 KB (erlang:process_info/2);
+//            Pekko typed actor idle ~1–2 KB (published Lightbend figures).
+// ---------------------------------------------------------------------------
+
+private fun runActorMemoryFootprint(
+    scope: CoroutineScope,
+    actorCount: Int,
+    useLoom: Boolean = false,
+): BenchResult = runBlocking {
+    val workerCtx: kotlin.coroutines.CoroutineContext =
+        if (useLoom) OtpDispatchers.IO else Dispatchers.Default
+
+    val heapBefore = stableHeap()
+
+    val refs = (0 until actorCount).map { i ->
+        GenServers.startLink(
+            scope, EchoServer(),
+            context = workerCtx,
+            name = "mem-${if (useLoom) "loom" else "dflt"}-$i",
+        )
+    }
+
+    val heapAfter = stableHeap()
+    val totalBytes = (heapAfter - heapBefore).coerceAtLeast(0L)
+    val bytesPerActor = if (actorCount > 0) totalBytes / actorCount else 0L
+
+    refs.forEach { runCatching { it.stop() } }
+
+    val label = if (useLoom) "actor_loom_memory_footprint_$actorCount"
+                else "actor_default_memory_footprint_$actorCount"
+    BenchResult(
+        name = label,
+        iterations = actorCount,
+        p50Micros = bytesPerActor.toDouble(),          // bytes per actor (field repurposed)
+        p95Micros = totalBytes.toDouble() / 1024.0,    // total KB
+        p99Micros = 0.0,
+        p999Micros = 0.0,
+        throughputPerSec = actorCount.toDouble(),
+        notes = "$actorCount idle actors; ${bytesPerActor}B/actor " +
+            "(${String.format("%.1f", bytesPerActor / 1024.0)}KB); " +
+            "total ${totalBytes / 1024}KB; GC-heuristic (System.gc advisory)",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Profile configuration
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +1259,7 @@ private fun parseProfile(args: Array<String>): BenchProfile {
             boundedMailboxSenders = 500,
             rounds = 5,
             tcpIterations = 10_000,
+            memoryActorCounts = listOf(100, 1_000, 5_000),
         )
         else -> BenchProfile(
             name = "quick",
@@ -1218,6 +1278,7 @@ private fun parseProfile(args: Array<String>): BenchProfile {
             boundedMailboxSenders = 300,
             rounds = 1,
             tcpIterations = 3_000,
+            memoryActorCounts = listOf(100, 1_000),
         )
     }
     return if (roundsArg != null && roundsArg > 0) base.copy(rounds = roundsArg) else base
@@ -1282,6 +1343,12 @@ private fun runRound(profile: BenchProfile, round: Int): List<BenchResult> {
         // --- Scenario E: worker pool checkout under load ---
         for (callers in profile.poolCallerCounts) {
             add(runWorkerPoolCheckout(scope, profile.poolSize, callers, profile.poolHoldMs))
+        }
+
+        // --- Scenario M: actor idle memory footprint ---
+        for (n in profile.memoryActorCounts) {
+            add(runActorMemoryFootprint(scope, n, useLoom = false))
+            add(runActorMemoryFootprint(scope, n, useLoom = true))
         }
 
         // --- Scenario J: cached read (non-suspending AtomicReference vs call) ---

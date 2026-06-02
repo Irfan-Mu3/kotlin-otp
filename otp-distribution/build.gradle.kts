@@ -31,4 +31,15 @@ tasks.test {
             showStandardStreams = true
         }
     }
+    // Pass -PskipSlowTests=true (or set org.otpstudy.skipSlowTests=true) to skip the
+    // multi-process wire soak tests that spawn external JVMs and take ~2 minutes each.
+    val skipSlow =
+        System.getProperty("org.otpstudy.skipSlowTests")?.equals("true", ignoreCase = true)
+            ?: project.findProperty("skipSlowTests")?.toString()?.equals("true", ignoreCase = true)
+            ?: false
+    if (skipSlow) {
+        exclude("**/KotlinNodeTransportMultiProcessTest*")
+        exclude("**/KotlinNodeTransportLoopbackTest*")
+        exclude("**/DistributionWireTest*")
+    }
 }
